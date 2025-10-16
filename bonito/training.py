@@ -105,7 +105,7 @@ class Trainer:
         self.restore_optim = restore_optim
         self.save_optim_every = save_optim_every
         self.grad_accum_split = grad_accum_split
-        self.scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        self.scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
         self.optimizer = None
         if quantile_grad_clip:
             self.clip_grad = ClipGrad()
@@ -120,24 +120,24 @@ class Trainer:
         self.optimizer.zero_grad()
 
         losses = None
-        with amp.autocast(enabled=self.use_amp):
-            for batch_ in zip(
-                *map(lambda t: t.chunk(self.grad_accum_split, dim=0), batch)
-            ):
-                data_, targets_, lengths_, *args = (x.to(self.device) for x in batch_)
+        for batch_ in zip(
+            *map(lambda t: t.chunk(self.grad_accum_split, dim=0), batch)
+        ):
+            data_, targets_, lengths_, *args = (x.to(self.device) for x in batch_)
 
+            with amp.autocast(enabled=self.use_amp):
                 scores_ = self.model(data_, *args)
                 losses_ = self.criterion(scores_, targets_, lengths_)
 
-                if not isinstance(losses_, dict): losses_ = {'loss': losses_}
+            if not isinstance(losses_, dict): losses_ = {'loss': losses_}
 
-                total_loss = losses_.get('total_loss', losses_['loss']) / self.grad_accum_split
-                self.scaler.scale(total_loss).backward()
+            total_loss = losses_.get('total_loss', losses_['loss']) / self.grad_accum_split
+            self.scaler.scale(total_loss).backward()
 
-                losses = {
-                    k: ((v.item() / self.grad_accum_split) if losses is None else (v.item() / self.grad_accum_split) + losses[k])
-                    for k, v in losses_.items()
-                }
+            losses = {
+                k: ((v.item() / self.grad_accum_split) if losses is None else (v.item() / self.grad_accum_split) + losses[k])
+                for k, v in losses_.items()
+            }
 
         scale = self.scaler.get_scale()
         self.scaler.unscale_(self.optimizer)
