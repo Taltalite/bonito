@@ -7,7 +7,7 @@
 [![py313](https://img.shields.io/badge/python-3.13-brightgreen.svg)](https://img.shields.io/badge/python-3.13-brightgreen.svg)
 [![py314](https://img.shields.io/badge/python-3.14-brightgreen.svg)](https://img.shields.io/badge/python-3.14-brightgreen.svg)
 [![cu128](https://img.shields.io/badge/cuda-12.8-blue.svg)](https://img.shields.io/badge/cuda-12.8-blue.svg)
-[![cu130](https://img.shields.io/badge/cuda-13.0.8-blue.svg)](https://img.shields.io/badge/cuda-13.0-blue.svg)
+[![cu130](https://img.shields.io/badge/cuda-13.0-blue.svg)](https://img.shields.io/badge/cuda-13.0-blue.svg)
 
 Bonito is an open source research basecaller for Oxford Nanopore reads.
 
