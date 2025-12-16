@@ -52,6 +52,31 @@ $ source venv3/bin/activate
 (venv3) $ pip install -e .[cu128] --extra-index-url https://download.pytorch.org/whl/cu128
 ```
 
+## Using `uv` for local development
+
+If you prefer [`uv`](https://github.com/astral-sh/uv) to manage the virtual
+environment and perform editable installs without touching your system
+Python, clone the repo and run:
+
+```bash
+$ uv venv --python 3.11 .venv         # or 3.10/3.12 as needed
+$ source .venv/bin/activate
+(.venv) $ uv pip install --upgrade pip
+(.venv) $ uv pip install -e .[cu128] --extra-index-url https://download.pytorch.org/whl/cu128
+```
+
+Notes:
+
+- The editable install (`-e`) keeps changes in your working copy immediately
+  importable. Use `[cu130]` (or omit the CUDA extra) if that matches your
+  system better.
+- If you do **not** want to install the package name, set `PYTHONPATH=$(pwd)`
+  after `uv pip install -r requirements.txt` and invoke commands with
+  `python -m bonito <subcommand>` instead of `bonito <subcommand>`.
+- `uv` respects the same dependency extras as `pip`, so any existing
+  instructions that reference `pip install -e .[...]` can be swapped directly
+  with `uv pip install -e .[...]` when the environment is activated.
+
 The `ont-bonito[cu128]` and `ont-bonito[cu130]` optional dependencies can be used, along
 with the corresponding `--extra-index-url`, to ensure the PyTorch package matches the
 local CUDA setup.
