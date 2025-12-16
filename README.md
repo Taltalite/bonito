@@ -52,6 +52,31 @@ $ source venv3/bin/activate
 (venv3) $ pip install -e .[cu128] --extra-index-url https://download.pytorch.org/whl/cu128
 ```
 
+## Using `uv` for local development
+
+If you prefer [`uv`](https://github.com/astral-sh/uv) to manage the virtual
+environment and perform editable installs without touching your system
+Python, clone the repo and run:
+
+```bash
+$ uv venv --python 3.11 .venv         # or 3.10/3.12 as needed
+$ source .venv/bin/activate
+(.venv) $ uv pip install --upgrade pip
+(.venv) $ uv pip install -e .[cu128] --extra-index-url https://download.pytorch.org/whl/cu128
+```
+
+Notes:
+
+- The editable install (`-e`) keeps changes in your working copy immediately
+  importable. Use `[cu130]` (or omit the CUDA extra) if that matches your
+  system better.
+- If you do **not** want to install the package name, set `PYTHONPATH=$(pwd)`
+  after `uv pip install -r requirements.txt` and invoke commands with
+  `python -m bonito <subcommand>` instead of `bonito <subcommand>`.
+- `uv` respects the same dependency extras as `pip`, so any existing
+  instructions that reference `pip install -e .[...]` can be swapped directly
+  with `uv pip install -e .[...]` when the environment is activated.
+
 The `ont-bonito[cu128]` and `ont-bonito[cu130]` optional dependencies can be used, along
 with the corresponding `--extra-index-url`, to ensure the PyTorch package matches the
 local CUDA setup.
@@ -63,6 +88,20 @@ local CUDA setup.
  - `bonito evaluate` - evaluate a model performance.
  - `bonito download` - download pretrained models and training datasets.
  - `bonito basecaller` - basecaller *(`.pod5` -> `.bam`)*.
+ - `bonito model-info` - print a torchinfo summary for a cached or downloaded basecaller model.
+
+## Basecaller model summary
+
+Use the `model-info` subcommand to download (if needed) and inspect a basecaller with
+[`torchinfo`](https://github.com/TylerYep/torchinfo). The example below targets CPU and
+uses a single sample with a 4000-length signal:
+
+```bash
+$ bonito model-info dna_r10.4.1_e8.2_400bps_hac@v5.2.0 --device cpu --signal-length 4000 --batch-size 1
+```
+
+Pass `--return-all-heads` when summarising multi-head models (e.g. custom configs that
+include modification heads).
 
 ### References
 

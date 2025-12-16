@@ -1,0 +1,52 @@
+[model]
+package = "bonito.model_custom"
+# default backbone uses these values if [backbone] is omitted
+features = 128
+activation = "swish"
+norm = "batchnorm"
+scale = 5.0
+
+# Optional multi-head outputs for tasks like DNA base modification tagging
+[[model.heads]]
+name = "modifications"
+labels = ["unmodified", "5mC"]
+
+[labels]
+labels = ["N", "A", "C", "G", "T"]
+
+[input]
+features = 1
+
+[global_norm]
+state_len = 5
+
+# Optional: override the default backbone with an explicit serial block
+[backbone]
+type = "serial"
+
+[[backbone.sublayers]]
+type = "convolution"
+insize = 1
+size = 64
+winlen = 5
+stride = 1
+padding = 2
+bias = true
+activation = "swish"
+norm = "batchnorm"
+
+[[backbone.sublayers]]
+type = "clamp"
+min = -1.0
+max = 1.0
+
+[[backbone.sublayers]]
+type = "convolution"
+insize = 64
+size = 128
+winlen = 5
+stride = 2
+padding = 2
+bias = true
+activation = "swish"
+norm = "batchnorm"
