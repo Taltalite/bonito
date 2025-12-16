@@ -63,6 +63,20 @@ local CUDA setup.
  - `bonito evaluate` - evaluate a model performance.
  - `bonito download` - download pretrained models and training datasets.
  - `bonito basecaller` - basecaller *(`.pod5` -> `.bam`)*.
+ - `bonito model-info` - print a torchinfo summary for a cached or downloaded basecaller model.
+
+## Basecaller model summary
+
+Use the `model-info` subcommand to download (if needed) and inspect a basecaller with
+[`torchinfo`](https://github.com/TylerYep/torchinfo). The example below targets CPU and
+uses a single sample with a 4000-length signal:
+
+```bash
+$ bonito model-info dna_r10.4.1_e8.2_400bps_hac@v5.2.0 --device cpu --signal-length 4000 --batch-size 1
+```
+
+Pass `--return-all-heads` when summarising multi-head models (e.g. custom configs that
+include modification heads).
 
 ### References
 
