@@ -21,7 +21,6 @@ def _ensure_model_available(model_directory: str) -> None:
 
 def main(args):
     _ensure_model_available(args.model_directory)
-
     sys.stderr.write(f"> loading model {args.model_directory}\n")
     model = load_model(
         args.model_directory,
