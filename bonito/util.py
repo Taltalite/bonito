@@ -10,6 +10,7 @@ from itertools import groupby
 from logging import getLogger
 from operator import itemgetter
 from importlib import import_module
+import importlib.util
 from collections import defaultdict, OrderedDict
 from pathlib import Path
 
@@ -230,7 +231,25 @@ def load_symbol(config, symbol):
         else:
             dirname = config
         config = toml.load(os.path.join(dirname, 'config.toml'))
-    imported = import_module(config['model']['package'])
+        config['__config_dir__'] = str(Path(dirname).resolve())
+    model_config = config.get('model', {})
+    model_file = model_config.get('file')
+    if model_file:
+        config_dir = config.get('__config_dir__')
+        if config_dir and not os.path.isabs(model_file):
+            model_file = os.path.join(config_dir, model_file)
+        else:
+            model_file = os.path.abspath(model_file)
+        if not os.path.exists(model_file):
+            raise FileNotFoundError(f"Model file not found: {model_file}")
+        module_name = f"bonito.model_file.{Path(model_file).stem}"
+        spec = importlib.util.spec_from_file_location(module_name, model_file)
+        module = importlib.util.module_from_spec(spec)
+        if spec.loader is None:
+            raise ImportError(f"Unable to load model file: {model_file}")
+        spec.loader.exec_module(module)
+        return getattr(module, symbol)
+    imported = import_module(model_config['package'])
     return getattr(imported, symbol)
 
 def load_object(package, obj_name):
@@ -276,6 +295,7 @@ def load_model(dirname, device, weights=None, half=True, chunksize=None, batchsi
         dirname = os.path.join(__models_dir__, dirname)
     weights = get_last_checkpoint(dirname) if weights is None else os.path.join(dirname, 'weights_%s.tar' % weights)
     config = toml.load(os.path.join(dirname, 'config.toml'))
+    config['__config_dir__'] = str(Path(dirname).resolve())
     config = set_config_defaults(config, chunksize, batchsize, overlap, quantize)
     return _load_model(weights, config, device, half, use_koi, compile)
 
