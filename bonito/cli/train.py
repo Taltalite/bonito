@@ -29,12 +29,14 @@ def main(args):
 
     if not args.pretrained:
         config = toml.load(args.config)
+        config["__config_dir__"] = str(Path(args.config).resolve().parent)
     else:
         dirname = args.pretrained
         if not os.path.isdir(dirname) and os.path.isdir(os.path.join(__models_dir__, dirname)):
             dirname = os.path.join(__models_dir__, dirname)
         pretrain_file = os.path.join(dirname, 'config.toml')
         config = toml.load(pretrain_file)
+        config["__config_dir__"] = str(Path(pretrain_file).resolve().parent)
         if 'lr_scheduler' in config:
             print("[ignoring 'lr_scheduler' in --pretrained config]")
             del config['lr_scheduler']
@@ -138,4 +140,3 @@ def argparser():
     quantile_group.set_defaults(quantile_grad_clip=True)
     parser.add_argument("--num-workers", default=4, type=int)
     return parser
-

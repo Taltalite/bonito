@@ -7,6 +7,11 @@ venv*/
 *.egg-info/
 bonito/data/*
 bonito/models/*
+!bonito/models/simple_cnn_model.py
+!bonito/models/simple_cnn_basecaller.py
+!bonito/models/configs/
+!bonito/models/configs/simple_cnn.toml
+!bonito/models/configs/simple_cnn_basecaller.toml
 dist/
 *.f[aq]
 *.[ct]sv
