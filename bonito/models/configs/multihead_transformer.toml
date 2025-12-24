@@ -1,0 +1,21 @@
+[model]
+file = "../../transformer/multihead_model.py"
+d_model = 256
+nhead = 4
+dim_feedforward = 1024
+num_layers = 4
+kernel_size = 5
+stride = 2
+num_mod_classes = 1
+mod_task = "multilabel"
+mod_loss_weight = 1.0
+
+[input]
+features = 1
+n_pre_post_context_bases = [3, 1]
+
+[labels]
+labels = ["", "A", "C", "G", "T"]
+
+[global_norm]
+state_len = 4

@@ -1,0 +1,15 @@
+[model]
+file = "../simple_cnn_basecaller.py"
+hidden_size = 64
+kernel_size = 5
+stride = 2
+
+[input]
+features = 1
+n_pre_post_context_bases = [3, 1]
+
+[labels]
+labels = ["", "A", "C", "G", "T"]
+
+[global_norm]
+state_len = 4
