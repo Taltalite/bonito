@@ -35,9 +35,12 @@ class SimpleCNNBasecallerEncoder(torch.nn.Module):
 
 class Model(SeqdistModel):
     def __init__(self, config):
+        labels = list(config["labels"]["labels"])
+        if not labels or labels[0] != "":
+            labels = ["", *labels]
         seqdist = CTC_CRF(
             state_len=config["global_norm"]["state_len"],
-            alphabet=config["labels"]["labels"],
+            alphabet=labels,
         )
 
         model_cfg = config["model"]

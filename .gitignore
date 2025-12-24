@@ -12,6 +12,7 @@ bonito/models/*
 !bonito/models/configs/
 !bonito/models/configs/simple_cnn.toml
 !bonito/models/configs/simple_cnn_basecaller.toml
+!bonito/models/configs/multihead_transformer.toml
 dist/
 *.f[aq]
 *.[ct]sv
