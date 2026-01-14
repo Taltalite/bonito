@@ -13,7 +13,54 @@ import torch
 
 from bonito.training_mod import TrainerMod
 from bonito.data import load_mod_data, ModelSetup, ComputeSettings, DataSettings
-from bonito.util import default_config, load_symbol, init
+from bonito.util import __models_dir__, default_config, get_last_checkpoint, load_symbol, init
+
+
+def load_pretrained_weights(model, pretrained, device):
+    dirname = pretrained
+    if not os.path.isdir(dirname) and os.path.isdir(os.path.join(__models_dir__, dirname)):
+        dirname = os.path.join(__models_dir__, dirname)
+
+    weights = get_last_checkpoint(dirname)
+    print(f"[loading pretrained weights] - {weights}")
+    state_dict = torch.load(weights, map_location=device)
+    state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+
+    model_state = model.state_dict()
+    matched = 0
+    for name, value in state_dict.items():
+        if name in model_state and model_state[name].shape == value.shape:
+            model_state[name] = value
+            matched += 1
+
+    model.load_state_dict(model_state)
+    skipped = len(state_dict) - matched
+    print(f"[loading pretrained weights] - matched={matched} skipped={skipped}")
+
+
+def freeze_parameters(module):
+    for param in module.parameters():
+        param.requires_grad = False
+
+
+def apply_freeze_settings(model, args):
+    frozen = []
+    if args.freeze_conv and hasattr(model, "conv"):
+        freeze_parameters(model.conv)
+        frozen.append("conv")
+
+    if hasattr(model, "encoder_layers"):
+        if args.freeze_encoder:
+            for layer in model.encoder_layers:
+                freeze_parameters(layer)
+            frozen.append("encoder_layers=all")
+        elif args.freeze_encoder_layers > 0:
+            for layer in model.encoder_layers[:args.freeze_encoder_layers]:
+                freeze_parameters(layer)
+            frozen.append(f"encoder_layers=first_{args.freeze_encoder_layers}")
+
+    if frozen:
+        print(f"[freezing parameters] - {', '.join(frozen)}")
 
 
 def main(args):
@@ -34,6 +81,9 @@ def main(args):
 
     print("[loading model]")
     model = load_symbol(config, 'Model')(config)
+    if args.pretrained:
+        load_pretrained_weights(model, args.pretrained, device)
+    apply_freeze_settings(model, args)
 
     try:
         model = torch.compile(model)
@@ -92,6 +142,10 @@ def argparser():
     )
     parser.add_argument("training_directory")
     parser.add_argument('--config', default=default_config)
+    parser.add_argument('--pretrained', default="")
+    parser.add_argument("--freeze-conv", action="store_true", default=False)
+    parser.add_argument("--freeze-encoder", action="store_true", default=False)
+    parser.add_argument("--freeze-encoder-layers", type=int, default=0)
     parser.add_argument("--directory", type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--lr", default='2e-3')
