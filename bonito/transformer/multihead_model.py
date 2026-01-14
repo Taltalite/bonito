@@ -109,7 +109,9 @@ class MultiHeadModel(torch.nn.Module):
         mod_logits = F.interpolate(mod_logits, size=max_len, mode="linear", align_corners=False)
         mod_logits = mod_logits.permute(0, 2, 1)
 
-        mask = torch.arange(max_len, device=mod_targets.device)[None, :] < target_lengths[:, None]
+        length_mask = torch.arange(max_len, device=mod_targets.device)[None, :] < target_lengths[:, None]
+        valid_mask = mod_targets != -100
+        mask = length_mask & valid_mask
         if self.num_mod_classes == 1:
             mod_targets = mod_targets.float()
             loss_raw = F.binary_cross_entropy_with_logits(mod_logits.squeeze(-1), mod_targets, reduction="none")
