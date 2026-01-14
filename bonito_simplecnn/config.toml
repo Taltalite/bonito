@@ -1,0 +1,41 @@
+__config_dir__ = "/home/lijy/workspace/bonito/bonito/models/configs"
+
+[model]
+file = "../simple_cnn_basecaller.py"
+hidden_size = 64
+kernel_size = 5
+stride = 2
+
+[input]
+features = 1
+n_pre_post_context_bases = [ 3, 1,]
+
+[labels]
+labels = [ "", "A", "C", "G", "T",]
+
+[global_norm]
+state_len = 4
+
+[training]
+command = "train"
+training_directory = "./bonito_simplecnn"
+config = "/home/lijy/workspace/bonito/bonito/models/configs/simple_cnn_basecaller.toml"
+pretrained = ""
+directory = "PosixPath('/data/biolab-nvme-pcie2/lijy/HG002/dataset/pod5_10')"
+device = "cuda"
+lr = "2e-3"
+seed = 25
+epochs = 30
+batch = 64
+chunks = 100000
+valid_chunks = 10000
+no_amp = false
+force = true
+restore_optim = false
+nondeterministic = false
+save_optim_every = 10
+grad_accum_split = 1
+quantile_grad_clip = true
+num_workers = 4
+func = "<function main at 0x76b78451beb0>"
+pwd = "/home/lijy/workspace/bonito"
