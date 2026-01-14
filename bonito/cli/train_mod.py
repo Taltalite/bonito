@@ -36,6 +36,9 @@ def load_pretrained_weights(model, pretrained, device):
     model.load_state_dict(model_state)
     skipped = len(state_dict) - matched
     print(f"[loading pretrained weights] - matched={matched} skipped={skipped}")
+    if matched == 0:
+        print("[warning] No pretrained weights matched current model parameters.")
+    return {"path": str(weights), "matched": matched, "skipped": skipped}
 
 
 def freeze_parameters(module):
@@ -82,7 +85,9 @@ def main(args):
     print("[loading model]")
     model = load_symbol(config, 'Model')(config)
     if args.pretrained:
-        load_pretrained_weights(model, args.pretrained, device)
+        preload_stats = load_pretrained_weights(model, args.pretrained, device)
+    else:
+        preload_stats = {}
     apply_freeze_settings(model, args)
 
     try:
@@ -114,6 +119,8 @@ def main(args):
         dataset_cfg = train_loader.dataset.dataset_config
     except AttributeError:
         dataset_cfg = {}
+    if preload_stats:
+        argsdict["training"]["pretrained_weights"] = preload_stats
     toml.dump({**config, **argsdict, **dataset_cfg}, open(os.path.join(workdir, 'config.toml'), 'w'))
 
     trainer = TrainerMod(
