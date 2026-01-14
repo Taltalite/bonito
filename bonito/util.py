@@ -316,13 +316,19 @@ def _load_model(model_file, config, device, half=True, use_koi=False, compile=Tr
         )
 
     state_dict = torch.load(model_file, map_location=device)
-    state_dict = {k2: state_dict[k1] for k1, k2 in match_names(state_dict, model).items()}
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        name = k.replace('module.', '')
-        new_state_dict[name] = v
-
-    model.load_state_dict(new_state_dict)
+    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+    model_state = model.state_dict()
+    if set(state_dict.keys()) == set(model_state.keys()):
+        model.load_state_dict(state_dict)
+    else:
+        try:
+            remapped = {k2: state_dict[k1] for k1, k2 in match_names(state_dict, model).items()}
+        except AssertionError as exc:
+            raise ValueError(
+                "Model weights do not match the current model architecture. "
+                "Ensure the config.toml and weights_*.tar are from the same model."
+            ) from exc
+        model.load_state_dict(remapped)
 
     if half:
         model = model.half()

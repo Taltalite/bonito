@@ -56,7 +56,7 @@ def main(args):
             overlap=args.overlap,
             batchsize=args.batchsize,
             quantize=args.quantize,
-            use_koi=True,
+            use_koi=args.use_koi,
         )
         model = model.apply(fuse_bn_)
     except FileNotFoundError:
@@ -187,6 +187,10 @@ def argparser():
     quant_parser.add_argument("--quantize", dest="quantize", action="store_true")
     quant_parser.add_argument("--no-quantize", dest="quantize", action="store_false")
     parser.set_defaults(quantize=None)
+    koi_parser = parser.add_mutually_exclusive_group(required=False)
+    koi_parser.add_argument("--use-koi", dest="use_koi", action="store_true")
+    koi_parser.add_argument("--no-use-koi", dest="use_koi", action="store_false")
+    parser.set_defaults(use_koi=True)
     parser.add_argument("--overlap", default=None, type=int)
     parser.add_argument("--chunksize", default=None, type=int)
     parser.add_argument("--batchsize", default=None, type=int)

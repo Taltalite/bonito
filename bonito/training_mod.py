@@ -106,7 +106,7 @@ class TrainerMod:
             ascii=True, leave=True, ncols=100, bar_format='{l_bar}{bar}| [{elapsed}{postfix}]',
             **tqdm_environ()
         )
-        smoothed_loss = None
+        smoothed_losses = None
 
         with progress_bar:
 
@@ -114,9 +114,20 @@ class TrainerMod:
                 chunks += batch[0].shape[0]
                 losses, grad_norm, scale = self.train_one_step(batch)
 
-                smoothed_loss = losses['loss'] if smoothed_loss is None else (0.01 * losses['loss'] + 0.99 * smoothed_loss)
+                if smoothed_losses is None:
+                    smoothed_losses = dict(losses)
+                else:
+                    smoothed_losses = {
+                        key: (0.01 * value + 0.99 * smoothed_losses[key])
+                        for key, value in losses.items()
+                    }
 
-                progress_bar.set_postfix(loss='%.4f' % smoothed_loss)
+                postfix = {"loss": "%.4f" % smoothed_losses.get("loss", 0.0)}
+                if "mod_loss" in smoothed_losses:
+                    postfix["mod_loss"] = "%.4f" % smoothed_losses["mod_loss"]
+                if "total_loss" in smoothed_losses:
+                    postfix["total_loss"] = "%.4f" % smoothed_losses["total_loss"]
+                progress_bar.set_postfix(postfix)
                 progress_bar.set_description("[{}/{}]".format(chunks, self.chunks_per_epoch))
                 progress_bar.update()
 
@@ -134,7 +145,7 @@ class TrainerMod:
 
                 if lr_scheduler is not None: lr_scheduler.step()
 
-        return smoothed_loss, perf_counter() - t0
+        return smoothed_losses or {}, perf_counter() - t0
 
     def validate_one_step(self, batch):
         data, targets, lengths, mod_targets, *args = batch
@@ -165,8 +176,13 @@ class TrainerMod:
         with torch.no_grad():
             seqs, refs, accs, losses = zip(*(self.validate_one_step(batch) for batch in self.valid_loader))
         seqs, refs, accs = (sum(x, []) for x in (seqs, refs, accs))
-        loss = np.mean([(x['loss'] if isinstance(x, dict) else x) for x in losses])
-        return loss, np.mean(accs), np.median(accs)
+        loss_metrics = {}
+        if all(isinstance(x, dict) for x in losses):
+            for key in losses[0]:
+                loss_metrics[key] = np.mean([x[key] for x in losses])
+        else:
+            loss_metrics["loss"] = np.mean(losses)
+        return loss_metrics, np.mean(accs), np.median(accs)
 
     def init_optimizer(self, lr, **optim_kwargs):
         if "package" in optim_kwargs:
@@ -191,27 +207,41 @@ class TrainerMod:
         for epoch in range(1 + last_epoch, epochs + 1):
             try:
                 with bonito.io.CSVLogger(os.path.join(workdir, 'losses_{}.csv'.format(epoch))) as loss_log:
-                    train_loss, duration = self.train_one_epoch(loss_log, lr_scheduler)
+                    train_losses, duration = self.train_one_epoch(loss_log, lr_scheduler)
 
                 model_state = self.model.module.state_dict() if hasattr(self.model, 'module') else self.model.state_dict()
                 torch.save(model_state, os.path.join(workdir, "weights_%s.tar" % epoch))
                 if epoch % self.save_optim_every == 0:
                     torch.save(self.optimizer.state_dict(), os.path.join(workdir, "optim_%s.tar" % epoch))
 
-                val_loss, val_mean, val_median = self.validate_one_epoch()
+                val_losses, val_mean, val_median = self.validate_one_epoch()
             except KeyboardInterrupt:
                 break
 
-            print("[epoch {}] directory={} loss={:.4f} mean_acc={:.3f}% median_acc={:.3f}%".format(
-                epoch, workdir, val_loss, val_mean, val_median
-            ))
+            val_loss = val_losses.get("loss", 0.0)
+            val_mod_loss = val_losses.get("mod_loss", None)
+            val_total_loss = val_losses.get("total_loss", None)
+            parts = [f"loss={val_loss:.4f}"]
+            if val_mod_loss is not None:
+                parts.append(f"mod_loss={val_mod_loss:.4f}")
+            if val_total_loss is not None:
+                parts.append(f"total_loss={val_total_loss:.4f}")
+            parts.append(f"mean_acc={val_mean:.3f}% median_acc={val_median:.3f}%")
+            print("[epoch {}] directory={} {}".format(epoch, workdir, " ".join(parts)))
 
             with bonito.io.CSVLogger(os.path.join(workdir, 'training.csv')) as training_log:
+                train_loss = train_losses.get("loss", None)
+                train_mod_loss = train_losses.get("mod_loss", None)
+                train_total_loss = train_losses.get("total_loss", None)
                 training_log.append({
                     "epoch": epoch,
                     "train_loss": train_loss,
+                    "train_mod_loss": train_mod_loss,
+                    "train_total_loss": train_total_loss,
                     "train_duration": duration,
                     "val_loss": val_loss,
+                    "val_mod_loss": val_mod_loss,
+                    "val_total_loss": val_total_loss,
                     "val_mean": val_mean,
                     "val_median": val_median,
                 })
