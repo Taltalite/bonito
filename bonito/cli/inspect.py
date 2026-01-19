@@ -20,9 +20,16 @@ def main(args):
     model = load_symbol(config, "Model")(config)
     model.to(args.device)
 
+    input_features = args.input_features
+    if input_features is None:
+        input_features = config.get("input", {}).get("features")
+    if input_features is None:
+        input_features = 1
+        print("[warning] config.input.features not found; defaulting to 1 input feature.")
+
     input_size = (
         args.batch_size,
-        args.input_features or config["input"]["features"],
+        input_features,
         args.signal_length,
     )
 
