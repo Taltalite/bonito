@@ -59,6 +59,12 @@ def load_pretrained_weights(model, pretrained, device):
     return {"path": str(weights), "matched": matched, "skipped": skipped}
 
 
+def merge_pretrained_config(config, pretrained_config):
+    for key in ("basecaller", "scaling", "standardisation", "normalisation", "run_info", "qscore", "input", "labels"):
+        if key not in config and key in pretrained_config:
+            config[key] = pretrained_config[key]
+
+
 def freeze_parameters(module):
     for param in module.parameters():
         param.requires_grad = False
@@ -176,6 +182,10 @@ def main(args):
 
     config = toml.load(args.config)
     config["__config_dir__"] = str(Path(args.config).resolve().parent)
+    if args.pretrained:
+        pretrained_dir = resolve_pretrained_dir(args.pretrained)
+        pretrained_config = toml.load(os.path.join(pretrained_dir, "config.toml"))
+        merge_pretrained_config(config, pretrained_config)
 
     argsdict = dict(training=vars(args))
     argsdict["training"]["pwd"] = os.getcwd()
