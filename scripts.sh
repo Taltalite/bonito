@@ -76,3 +76,139 @@ python -m bonito train -f /data/biolab-nvme-pcie2/lijy/HG002/bonito_models/bonit
  --batch 32 \
  --lr 1e-4 \
  --config /home/lijy/workspace/bonito-uv/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0/config.toml
+
+
+
+
+# =========================== Multihead ===================================
+
+
+python -m bonito train_mod -f /data/biolab-nvme-pcie2/lijy/HG002/multihead_models/bonito_r10_sup@v5.2.0_doradov8dataset_0114 \
+ --config /home/lijy/workspace/bonito/bonito/models/configs/multihead_transformer.toml \
+ --pretrained /home/lijy/workspace/bonito-uv/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0/ \
+ --freeze-conv \
+ --directory /data/biolab-nvme-pcie2/lijy/HG002/dataset/pod5_10_dorado_v8/ \
+ --device cuda:0 \
+ --epochs 20 \
+ --lr 1e-4 \
+ --batch 32 \
+ --chunks 50000 \
+ --valid-chunks 5000 \
+
+
+# =========================== TEST BASECALL ===================================
+
+bonito basecaller \
+ dna_r10.4.1_e8.2_400bps_sup@v5.2.0 \
+ --device cuda:0 \
+ /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1 \
+ > /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1_testcalled/bonito_sup/bonito_r10_sup@v5.2.0_std.bam
+
+samtools fastq -T "*" ./bonito_r10_sup@v5.2.0_std.bam | \
+minimap2 -ax map-ont -t 16 --secondary=no /data/biolab-nvme-pcie2/lijy/HG002/hg38.fa - | \
+samtools sort -o ./bonito_r10_sup@v5.2.0_std_aligned.bam
+
+samtools index ./bonito_r10_sup@v5.2.0_std_aligned.bam
+
+
+bonito basecaller \
+ /home/lijy/workspace/bonito/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0_doradov8set \
+ --device cuda:0 \
+ --max-reads 1000 \
+ /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1 \
+ > /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1_testcalled/bonito_sup/doradov8set/bonito_r10_sup@v5.2.0_doradov8dataset.bam
+
+samtools fastq -T "*" ./bonito_r10_sup@v5.2.0_doradov8dataset.bam | \
+minimap2 -ax map-ont -t 16 --secondary=no /data/biolab-nvme-pcie2/lijy/HG002/hg38.fa - | \
+samtools sort -o ./bonito_r10_sup@v5.2.0_doradov8dataset_aligned.bam
+
+samtools index ./bonito_r10_sup@v5.2.0_doradov8dataset_aligned.bam
+
+
+
+bonito basecaller \
+ /home/lijy/workspace/bonito/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0_bonitoset/ \
+ --device cuda:0 \
+ --max-reads 1000 \
+ /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1 \
+ > /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1_testcalled/bonito_sup/bonito_r10_sup@v5.2.0_bonitoset.bam
+
+samtools fastq -T "*" ./bonito_r10_sup@v5.2.0_bonitoset.bam | \
+minimap2 -ax map-ont -t 16 --secondary=no /data/biolab-nvme-pcie2/lijy/HG002/hg38.fa - | \
+samtools sort -o ./bonito_r10_sup@v5.2.0_bonitoset_aligned.bam
+
+samtools index ./bonito_r10_sup@v5.2.0_bonitoset_aligned.bam
+
+
+
+
+
+python -m bonito basecaller \
+ /home/lijy/workspace/bonito/bonito/models/multihead_transformer \
+ --device cuda:0 \
+ --max-reads 1000 \
+ --no-use-koi \
+ /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1 \
+ > /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1_testcalled/bonito_sup/bonito_r10_sup@v5.2.0_multihead.bam
+
+samtools fastq -T "*" ./bonito_r10_sup@v5.2.0_bonitoset.bam | \
+minimap2 -ax map-ont -t 16 --secondary=no /data/biolab-nvme-pcie2/lijy/HG002/hg38.fa - | \
+samtools sort -o ./bonito_r10_sup@v5.2.0_bonitoset_aligned.bam
+
+samtools index ./bonito_r10_sup@v5.2.0_bonitoset_aligned.bam
+
+
+
+# =========================== CTC CRF Finetune ===================================
+
+python -m bonito finetune -f /data/biolab-nvme-pcie2/lijy/HG002/bonito_models/bonito_r10_sup@v5.2.0_doradov8dataset_ft \
+ --directory /data/biolab-nvme-pcie2/lijy/HG002/dataset/pod5_10_dorado_v8/ \
+ --pretrained /home/lijy/workspace/bonito/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0/ \
+ --epochs 30 \
+ --chunks 100000 \
+ --valid-chunks 10000 \
+ --batch 64 \
+ --lr 1e-4 \
+ --config /home/lijy/workspace/bonito/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0_finetune/config.toml
+
+python -m bonito basecaller \
+ /home/lijy/workspace/bonito/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0_v8ft/ \
+ --device cuda:0 \
+ --max-reads 1500 \
+ --no-use-koi \
+ /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1 \
+ > /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1_testcalled/bonito_sup/v8ft/bonito_r10_sup@v5.2.0_v8ft.bam
+
+samtools fastq -T "*" ./bonito_r10_sup@v5.2.0_v8ft.bam | \
+minimap2 -ax map-ont -t 16 --secondary=no /data/biolab-nvme-pcie2/lijy/HG002/hg38.fa - | \
+samtools sort -o ./bonito_r10_sup@v5.2.0_v8ft_aligned.bam
+
+samtools index ./bonito_r10_sup@v5.2.0_v8ft_aligned.bam
+
+
+
+
+python -m bonito finetune -f /data/biolab-nvme-pcie2/lijy/HG002/bonito_models/bonito_r10_sup@v5.2.0_bonitodataset_ft \
+ --directory /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_10_called/bonito_sup/ \
+ --pretrained /home/lijy/workspace/bonito/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0/ \
+ --epochs 10 \
+ --chunks 100000 \
+ --valid-chunks 10000 \
+ --batch 32 \
+ --lr 1e-4 \
+ --config /home/lijy/workspace/bonito/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0_finetune/config.toml
+
+
+python -m bonito basecaller \
+ /home/lijy/workspace/bonito/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0_boft/ \
+ --device cuda:0 \
+ --max-reads 1500 \
+ --no-use-koi \
+ /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1 \
+ > /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1_testcalled/bonito_sup/bonitoft/bonito_r10_sup@v5.2.0_bonitoft.bam
+
+samtools fastq -T "*" ./bonito_r10_sup@v5.2.0_bonitoft.bam | \
+minimap2 -ax map-ont -t 16 --secondary=no /data/biolab-nvme-pcie2/lijy/HG002/hg38.fa - | \
+samtools sort -o ./bonito_r10_sup@v5.2.0_bonitoft_aligned.bam
+
+samtools index ./bonito_r10_sup@v5.2.0_bonitoft_aligned.bam
