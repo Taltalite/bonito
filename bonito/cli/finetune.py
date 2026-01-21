@@ -15,7 +15,7 @@ import torch
 
 from bonito.training import Trainer
 from bonito.data import load_data, ModelSetup, ComputeSettings, DataSettings
-from bonito.util import __models_dir__, default_config, get_last_checkpoint, load_symbol, init
+from bonito.util import __models_dir__, default_config, get_last_checkpoint, load_symbol, init, match_names
 
 
 def resolve_pretrained_dir(pretrained):
@@ -34,13 +34,25 @@ def load_pretrained_weights(model, pretrained, device):
 
     model_state = model.state_dict()
     matched = 0
-    for name, value in state_dict.items():
+    remapped = None
+
+    if set(state_dict.keys()) != set(model_state.keys()):
+        try:
+            remapped = {
+                k2: state_dict[k1]
+                for k1, k2 in match_names(state_dict, model).items()
+            }
+        except AssertionError:
+            remapped = None
+
+    to_load = remapped if remapped is not None else state_dict
+    for name, value in to_load.items():
         if name in model_state and model_state[name].shape == value.shape:
             model_state[name] = value
             matched += 1
 
     model.load_state_dict(model_state)
-    skipped = len(state_dict) - matched
+    skipped = len(to_load) - matched
     print(f"[loading pretrained weights] - matched={matched} skipped={skipped}")
     if matched == 0:
         print("[warning] No pretrained weights matched current model parameters.")
