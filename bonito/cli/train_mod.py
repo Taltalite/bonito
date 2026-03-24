@@ -6,6 +6,7 @@ Bonito training for multi-head (base + modification) models.
 
 import os
 from pathlib import Path
+from importlib import import_module
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 
 import toml
@@ -153,9 +154,18 @@ def main(args):
         argsdict["training"]["pretrained_weights"] = preload_stats
     toml.dump({**config, **argsdict, **dataset_cfg}, open(os.path.join(workdir, 'config.toml'), 'w'))
 
+    if config.get("lr_scheduler"):
+        sched_config = config["lr_scheduler"]
+        lr_scheduler_fn = getattr(
+            import_module(sched_config["package"]), sched_config["symbol"]
+        )(**sched_config)
+    else:
+        lr_scheduler_fn = None
+
     trainer = TrainerMod(
         model, device, train_loader, valid_loader,
         use_amp=not args.no_amp,
+        lr_scheduler_fn=lr_scheduler_fn,
         restore_optim=args.restore_optim,
         save_optim_every=args.save_optim_every,
         grad_accum_split=args.grad_accum_split,

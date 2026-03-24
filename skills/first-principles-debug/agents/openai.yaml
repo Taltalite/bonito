@@ -1,0 +1,5 @@
+﻿version: 1
+interface:
+  display_name: First-Principles Debug
+  short_description: Reframe stuck debugging using axioms and minimal falsifiable steps.
+  default_prompt: Reframe this debugging problem from first principles. State the physical essence in one sentence, list immutable facts, separate habitual choices from necessary constraints, derive the shortest falsifiable path, and if goals are unclear ask clarifying questions before coding.

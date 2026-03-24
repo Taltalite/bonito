@@ -40,6 +40,7 @@ For development of modified base calling models please see [remora](https://gith
 ## Training your own model
 
 For detailed information on the training process, please see the [Training Documentation](documentation/training.md).
+For shared-encoder multi-head training with base and modification targets, see [`bonito train_mod`](documentation/train_mod.md).
 
 ## Developer Quickstart
 

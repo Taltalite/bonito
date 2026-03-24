@@ -29,10 +29,72 @@ class ModelSetup:
     standardisation: Dict
 
 
+def _shape_list(array):
+    return [int(dim) for dim in array.shape]
+
+
+def _build_dataset_config(chunks, targets, lengths, mod_targets=None):
+    dataset = {
+        "format": "numpy",
+        "num_samples": int(lengths.shape[0]),
+        "chunk_shape": _shape_list(chunks),
+        "reference_shape": _shape_list(targets),
+        "reference_lengths_shape": _shape_list(lengths),
+    }
+    if mod_targets is not None:
+        dataset["mod_targets_shape"] = _shape_list(mod_targets)
+    return {"dataset": dataset}
+
+
+def _require_numpy_files(directory, filenames):
+    missing = [name for name in filenames if not os.path.exists(os.path.join(directory, name))]
+    if missing:
+        names = ", ".join(missing)
+        raise FileNotFoundError(f"Missing required dataset files in {directory}: {names}")
+
+
+def _validate_core_arrays(chunks, targets, lengths, directory):
+    if chunks.ndim != 2:
+        raise ValueError(f"{directory}: chunks.npy must have shape [N, chunk_length], got {tuple(chunks.shape)}")
+    if targets.ndim != 2:
+        raise ValueError(f"{directory}: references.npy must have shape [N, max_target_len], got {tuple(targets.shape)}")
+    if lengths.ndim != 1:
+        raise ValueError(f"{directory}: reference_lengths.npy must have shape [N], got {tuple(lengths.shape)}")
+
+    num_samples = chunks.shape[0]
+    if targets.shape[0] != num_samples or lengths.shape[0] != num_samples:
+        raise ValueError(
+            f"{directory}: dataset files must share the same first dimension N, got "
+            f"chunks={chunks.shape[0]}, references={targets.shape[0]}, reference_lengths={lengths.shape[0]}"
+        )
+
+    if lengths.size and int(lengths.max()) > targets.shape[1]:
+        raise ValueError(
+            f"{directory}: max(reference_lengths.npy)={int(lengths.max())} exceeds references.npy width={targets.shape[1]}"
+        )
+
+
+def _validate_mod_arrays(chunks, targets, lengths, mod_targets, directory):
+    _validate_core_arrays(chunks, targets, lengths, directory)
+
+    if mod_targets.ndim != 2:
+        raise ValueError(f"{directory}: mod_targets.npy must have shape [N, max_target_len], got {tuple(mod_targets.shape)}")
+    if mod_targets.shape[0] != chunks.shape[0]:
+        raise ValueError(
+            f"{directory}: mod_targets.npy must share the same first dimension N as chunks.npy, got "
+            f"chunks={chunks.shape[0]}, mod_targets={mod_targets.shape[0]}"
+        )
+    if lengths.size and int(lengths.max()) > mod_targets.shape[1]:
+        raise ValueError(
+            f"{directory}: max(reference_lengths.npy)={int(lengths.max())} exceeds mod_targets.npy width={mod_targets.shape[1]}"
+        )
+
+
 def load_data(data, model_setup, compute_settings):
     try:
         if (Path(data.training_data) / "chunks.npy").exists():
             print(f"[loading data] - chunks from {data.training_data}")
+            _require_numpy_files(data.training_data, ("chunks.npy", "references.npy", "reference_lengths.npy"))
             train_loader_kwargs, valid_loader_kwargs = load_numpy(
                 data.num_train_chunks,
                 data.training_data,
@@ -74,6 +136,7 @@ class ChunkDataSet:
         self.chunks = np.expand_dims(chunks, axis=1)
         self.targets = targets
         self.lengths = lengths
+        self.dataset_config = _build_dataset_config(chunks, targets, lengths)
 
     def __getitem__(self, i):
         return (
@@ -92,6 +155,7 @@ class ModChunkDataSet:
         self.targets = targets
         self.lengths = lengths
         self.mod_targets = mod_targets
+        self.dataset_config = _build_dataset_config(chunks, targets, lengths, mod_targets=mod_targets)
 
     def __getitem__(self, i):
         return (
@@ -139,6 +203,10 @@ def load_mod_data(data, model_setup, compute_settings):
     try:
         if (Path(data.training_data) / "chunks.npy").exists():
             print(f"[loading data] - chunks from {data.training_data}")
+            _require_numpy_files(
+                data.training_data,
+                ("chunks.npy", "references.npy", "reference_lengths.npy", "mod_targets.npy"),
+            )
             train_loader_kwargs, valid_loader_kwargs = load_numpy_mod(
                 data.num_train_chunks,
                 data.training_data,
@@ -196,6 +264,7 @@ def load_numpy_datasets(limit=None, directory=None):
         targets = targets[:limit]
         lengths = lengths[:limit]
 
+    _validate_core_arrays(chunks, targets, lengths, directory)
     return np.array(chunks), np.array(targets), np.array(lengths)
 
 
@@ -237,4 +306,6 @@ def load_numpy_mod_datasets(limit=None, directory=None):
         lengths = lengths[:limit]
         mod_targets = mod_targets[:limit]
 
+    _validate_mod_arrays(chunks, targets, lengths, mod_targets, directory)
     return np.array(chunks), np.array(targets), np.array(lengths), np.array(mod_targets)
+

@@ -1,0 +1,5 @@
+﻿version: 1
+interface:
+  display_name: Nanopore Data Version Guard
+  short_description: Enforce version-aware nanopore raw-signal I/O, dependency checks, and ingestion validation.
+  default_prompt: Handle nanopore data with strict version awareness. Determine data version assumptions (R10.4.1, R9.4, etc.), map to expected suffix (.pod5 or .fast5), choose matching Python dependencies and APIs, and require ingestion checks that prove the data was loaded correctly before continuing.

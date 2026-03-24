@@ -1,0 +1,4 @@
+interface:
+  display_name: "LF Line Endings"
+  short_description: "Keep repo edits on LF for Ubuntu and WSL workflows."
+  default_prompt: "Use $lf-line-endings when editing files in this repository so saved content keeps LF line endings."

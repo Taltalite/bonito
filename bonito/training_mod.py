@@ -6,8 +6,10 @@ import math
 import os
 from itertools import islice
 from time import perf_counter
+from datetime import datetime
 
 from bonito.schedule import linear_warmup_cosine_decay
+from bonito.training import load_state
 from bonito.util import permute, decode_ref, accuracy, tqdm_environ, load_object
 import bonito
 
@@ -201,7 +203,12 @@ class TrainerMod:
         if self.optimizer is None:
             self.init_optimizer(lr, **optim_kwargs)
 
-        last_epoch = 0
+        last_epoch = load_state(workdir, self.device, self.model, self.optimizer if self.restore_optim else None)
+
+        if self.restore_optim:
+            for i, pg in enumerate(self.optimizer.param_groups):
+                pg["initial_lr"] = pg["lr"] = lr[i] if isinstance(lr, (list, tuple)) else lr
+
         lr_scheduler = self.get_lr_scheduler(epochs, last_epoch=last_epoch)
 
         for epoch in range(1 + last_epoch, epochs + 1):
@@ -234,6 +241,7 @@ class TrainerMod:
                 train_mod_loss = train_losses.get("mod_loss", None)
                 train_total_loss = train_losses.get("total_loss", None)
                 training_log.append({
+                    "time": datetime.today(),
                     "epoch": epoch,
                     "train_loss": train_loss,
                     "train_mod_loss": train_mod_loss,
@@ -245,3 +253,4 @@ class TrainerMod:
                     "val_mean": val_mean,
                     "val_median": val_median,
                 })
+
