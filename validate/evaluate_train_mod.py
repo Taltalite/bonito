@@ -434,79 +434,119 @@ def save_signal_alignment_examples(signal_examples: List[Dict[str, object]], out
 
         x = np.arange(signal.size, dtype=np.int64)
         plot_x, plot_signal = _downsample_trace(x, signal, max_points=4000)
+        signal_min = float(np.min(signal))
         signal_max = float(np.max(signal))
-        signal_span = max(signal_max - float(np.min(signal)), 1e-6)
+        signal_span = max(signal_max - signal_min, 1e-6)
 
         emit_positions = np.asarray(example["emit_positions"], dtype=np.int64)
-        emit_signal_positions = emit_positions * int(stride)
+        emit_signal_positions = np.clip(emit_positions * int(stride), 0, signal.size - 1)
         mod_probs = np.asarray(example["mod_probs"], dtype=np.float32)
         base_labels = list(example["base_labels"])
         site_records = list(example["site_records"])
 
-        fig, axes = plt.subplots(2, 1, figsize=(15, 8), gridspec_kw={"height_ratios": [2.2, 1.2]})
+        fig, ax_signal = plt.subplots(figsize=(16, 7))
+        ax_mod = ax_signal.twinx()
 
-        axes[0].plot(plot_x, plot_signal, linewidth=0.8, color="#4c566a")
-        axes[0].set_title(
-            f"Chunk {example['chunk_index']} Signal / Base / Mod Alignment\n"
+        ax_signal.plot(plot_x, plot_signal, linewidth=0.9, color="#4c566a", label="signal")
+        ax_signal.set_title(
+            f"Chunk {example['chunk_index']} Aligned Signal / Base / Mod View\n"
             f"pred_len={example['predicted_base_len']} target_len={example['target_len']} "
             f"target_cov={example['target_coverage']:.3f} valid_mod_cov={example['valid_mod_coverage']:.3f}"
         )
-        axes[0].set_ylabel("Current")
+        ax_signal.set_xlabel("Signal sample index")
+        ax_signal.set_ylabel("Current")
+        ax_mod.set_ylabel("Mod probability")
+        ax_mod.set_ylim(-0.10, 1.25)
 
         if emit_signal_positions.size:
-            clipped_positions = np.clip(emit_signal_positions, 0, signal.size - 1)
-            emit_signal_values = signal[clipped_positions]
-            scatter = axes[0].scatter(
-                clipped_positions,
-                emit_signal_values,
-                c=mod_probs if mod_probs.size else np.zeros_like(clipped_positions, dtype=np.float32),
+            line_alpha = min(0.18, max(0.03, 18.0 / max(len(emit_signal_positions), 1)))
+            for raw_x in emit_signal_positions:
+                ax_signal.axvline(int(raw_x), color="#8fbcbb", alpha=line_alpha, linewidth=0.6, zorder=0)
+
+            ax_mod.plot(emit_signal_positions, mod_probs, color="#2ca02c", linewidth=1.2, alpha=0.9, label="pred mod prob")
+            scatter = ax_mod.scatter(
+                emit_signal_positions,
+                mod_probs,
+                c=mod_probs if mod_probs.size else np.zeros_like(emit_signal_positions, dtype=np.float32),
                 cmap="coolwarm",
-                s=18,
-                alpha=0.85,
-                edgecolors="none",
+                s=22,
+                alpha=0.95,
+                edgecolors="black",
+                linewidths=0.2,
                 vmin=0.0,
                 vmax=1.0,
+                label="pred bases",
             )
-            cbar = fig.colorbar(scatter, ax=axes[0], pad=0.01)
+            cbar = fig.colorbar(scatter, ax=ax_signal, pad=0.01)
             cbar.set_label("Predicted mod probability")
 
             label_limit = min(len(base_labels), 40)
             label_stride = max(label_limit // 20, 1)
+            label_y = signal_max + 0.04 * signal_span
             for idx in range(0, label_limit, label_stride):
-                x_pos = int(clipped_positions[idx])
-                y_pos = float(emit_signal_values[idx]) + 0.04 * signal_span
-                axes[0].text(x_pos, y_pos, str(base_labels[idx]), fontsize=7, ha="center", va="bottom", rotation=90)
+                ax_signal.text(
+                    int(emit_signal_positions[idx]),
+                    label_y,
+                    str(base_labels[idx]),
+                    fontsize=7,
+                    ha="center",
+                    va="bottom",
+                    rotation=90,
+                    color="#2e3440",
+                )
 
-        true_mod_x = []
-        true_mod_y = []
-        true_mod_colors = []
-        for record in site_records:
-            raw_x = int(record["time_step"]) * int(stride)
-            raw_x = max(0, min(raw_x, signal.size - 1))
-            true_mod_x.append(raw_x)
-            true_mod_y.append(signal_max + 0.15 * signal_span)
-            true_mod_colors.append("#d62728" if int(record["true_mod"]) == 1 else "#1f77b4")
-        if true_mod_x:
-            axes[0].scatter(true_mod_x, true_mod_y, marker="v", c=true_mod_colors, s=30, alpha=0.9, label="target mod labels")
-            axes[0].legend(loc="upper right")
+        if site_records:
+            aligned_x = np.asarray([
+                max(0, min(int(record["time_step"]) * int(stride), signal.size - 1))
+                for record in site_records
+            ], dtype=np.int64)
+            pred_indices = [int(record["predicted_base_index"]) for record in site_records]
+            pred_scores = np.asarray([
+                float(mod_probs[idx]) if idx < len(mod_probs) else float(record.get("score", 0.0))
+                for idx in pred_indices
+            ], dtype=np.float32)
+            pred_colors = ["#d62728" if int(record["pred_mod"]) == 1 else "#1f77b4" for record in site_records]
+            true_colors = ["#d62728" if int(record["true_mod"]) == 1 else "#1f77b4" for record in site_records]
 
-        base_index = np.arange(len(base_labels), dtype=np.int64)
-        if len(base_labels):
-            axes[1].plot(base_index, mod_probs if mod_probs.size else np.zeros(len(base_labels), dtype=np.float32), color="#2ca02c", linewidth=1.1)
-            axes[1].scatter(base_index, mod_probs if mod_probs.size else np.zeros(len(base_labels), dtype=np.float32), color="#2ca02c", s=12)
+            ax_mod.scatter(
+                aligned_x,
+                pred_scores,
+                marker="D",
+                c=pred_colors,
+                s=34,
+                alpha=0.95,
+                edgecolors="black",
+                linewidths=0.35,
+                label="aligned predicted mod",
+                zorder=4,
+            )
+            ax_mod.scatter(
+                aligned_x,
+                np.full(len(aligned_x), 1.10, dtype=np.float32),
+                marker="v",
+                c=true_colors,
+                s=42,
+                alpha=0.95,
+                edgecolors="black",
+                linewidths=0.35,
+                label="aligned target mod",
+                zorder=5,
+            )
 
-        aligned_pred_indices = [int(record["predicted_base_index"]) for record in site_records]
-        aligned_true_mod = [int(record["true_mod"]) for record in site_records]
-        if aligned_pred_indices:
-            y_vals = [mod_probs[idx] if idx < len(mod_probs) else 0.0 for idx in aligned_pred_indices]
-            colors = ["#d62728" if value == 1 else "#1f77b4" for value in aligned_true_mod]
-            axes[1].scatter(aligned_pred_indices, y_vals, marker="D", c=colors, s=28, alpha=0.95, label="aligned target mod labels")
-            axes[1].legend(loc="upper right")
+            annotate_limit = min(len(site_records), 30)
+            annotate_stride = max(annotate_limit // 15, 1)
+            for idx in range(0, annotate_limit, annotate_stride):
+                record = site_records[idx]
+                x_pos = int(aligned_x[idx])
+                ref_text = f"{record['ref_base']}:{int(record['true_mod'])}"
+                pred_text = f"p:{int(record['pred_mod'])}"
+                ax_mod.text(x_pos, 1.16, ref_text, fontsize=7, ha="center", va="bottom", rotation=90, color="#5e81ac")
+                ax_mod.text(x_pos, min(float(pred_scores[idx]) + 0.06, 1.02), pred_text, fontsize=7, ha="center", va="bottom", rotation=90, color="#bf616a")
 
-        axes[1].set_title("Per-base Modification Scores on Predicted Base Axis")
-        axes[1].set_xlabel("Predicted base index")
-        axes[1].set_ylabel("Mod probability")
-        axes[1].set_ylim(-0.05, 1.05)
+        signal_handles, signal_labels = ax_signal.get_legend_handles_labels()
+        mod_handles, mod_labels = ax_mod.get_legend_handles_labels()
+        if signal_handles or mod_handles:
+            ax_signal.legend(signal_handles + mod_handles, signal_labels + mod_labels, loc="upper left", fontsize=8)
 
         fig.tight_layout()
         path = output_dir / f"signal_mod_alignment_chunk_{int(example['chunk_index'])}.png"
@@ -515,8 +555,6 @@ def save_signal_alignment_examples(signal_examples: List[Dict[str, object]], out
         written.append(path.name)
 
     return written
-
-
 def build_text_summary(summary: Dict[str, object]) -> str:
     base = summary["base"]
     alignment = summary["alignment"]
