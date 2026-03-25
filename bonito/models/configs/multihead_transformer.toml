@@ -1,5 +1,5 @@
 [model]
-file = "../../transformer/multihead_model.py"
+package = "bonito.transformer.multihead_model"
 d_model = 256
 nhead = 4
 dim_feedforward = 1024
@@ -9,10 +9,12 @@ stride = 2
 num_mod_classes = 1
 mod_task = "multilabel"
 mod_loss_weight = 1.0
+mod_target_projection = "viterbi_edlib_equal"
+mod_decode_projection = "viterbi_path"
 
 [input]
 features = 1
-n_pre_post_context_bases = [3, 1]
+n_pre_post_context_bases = [0, 0]
 
 [labels]
 labels = ["", "A", "C", "G", "T"]

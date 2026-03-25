@@ -8,6 +8,8 @@ Outputs:
 - base_alignments.tsv
 - sequence_examples.tsv
 - mod_site_examples.tsv
+- mod_alignment_summary.tsv
+- predicted_base_examples.tsv
 - PNG plots when matplotlib is available
 """
 
@@ -392,6 +394,7 @@ def save_training_curves(model_directory: Path, output_dir: Path) -> List[str]:
 
 def build_text_summary(summary: Dict[str, object]) -> str:
     base = summary["base"]
+    alignment = summary["alignment"]
     mod = summary["modification"]
     lines = [
         f"model_directory: {summary['model_directory']}",
@@ -408,6 +411,13 @@ def build_text_summary(summary: Dict[str, object]) -> str:
         f"sub_rate: {base['sub_rate']:.4f}",
         f"ins_rate: {base['ins_rate']:.4f}",
         f"del_rate: {base['del_rate']:.4f}",
+        "",
+        "[alignment]",
+        f"mean_target_coverage: {alignment['mean_target_coverage']:.4f}",
+        f"mean_predicted_base_coverage: {alignment['mean_predicted_base_coverage']:.4f}",
+        f"mean_valid_mod_coverage: {alignment['mean_valid_mod_coverage']:.4f}",
+        f"mean_predicted_base_len: {alignment['mean_predicted_base_len']:.2f}",
+        f"mean_target_len: {alignment['mean_target_len']:.2f}",
         "",
         "[modification]",
         f"task_type: {mod['task_type']}",
@@ -451,6 +461,8 @@ def main(args):
         half=use_half,
         compile=not args.no_compile,
     )
+    if not hasattr(model, "align_predictions_to_targets") or not hasattr(model, "predict_mods"):
+        raise RuntimeError("Loaded model does not provide per-base modification alignment helpers.")
 
     standardisation = model.config.get("standardisation", {}) if args.standardise else {}
     model_setup = ModelSetup(
@@ -474,6 +486,8 @@ def main(args):
     base_records: List[Dict[str, object]] = []
     sequence_examples: List[Dict[str, object]] = []
     mod_site_examples: List[Dict[str, object]] = []
+    mod_alignment_records: List[Dict[str, object]] = []
+    predicted_base_examples: List[Dict[str, object]] = []
 
     binary_true: List[np.ndarray] = []
     binary_prob: List[np.ndarray] = []
@@ -527,63 +541,64 @@ def main(args):
                         "accuracy_pct": acc_pct,
                     })
 
-            max_target_len = mod_targets.size(1)
-            interpolated = interpolate_mod_logits(outputs["mod_logits"].detach().to(torch.float32), max_target_len).cpu()
-            targets_cpu = targets.cpu()
-            lengths_cpu = lengths.cpu()
-            mod_targets_cpu = mod_targets.cpu()
+            per_base_predictions = model.predict_mods(outputs, mod_threshold=args.mod_threshold)
+            remaining_site_slots = max(args.site_report_limit - len(mod_site_examples), 0)
+            projection = model.align_predictions_to_targets(
+                outputs,
+                targets_device,
+                lengths_device,
+                mod_targets_device,
+                mod_threshold=args.mod_threshold,
+                include_site_records=remaining_site_slots > 0,
+                site_record_limit=remaining_site_slots,
+            )
 
-            position_index = torch.arange(max_target_len)[None, :]
-            valid_mask = (position_index < lengths_cpu[:, None]) & (mod_targets_cpu != -100)
+            flat_logits = projection["flat_logits"].detach().to(torch.float32)
+            flat_targets = projection["flat_targets"].detach().cpu().numpy().astype(np.int64)
+            if flat_targets.size:
+                if getattr(model, "num_mod_classes", 1) == 1:
+                    binary_true.append(flat_targets)
+                    binary_prob.append(torch.sigmoid(flat_logits.squeeze(-1)).cpu().numpy().astype(np.float32))
+                else:
+                    probs = torch.softmax(flat_logits, dim=-1)
+                    multiclass_true.append(flat_targets)
+                    multiclass_pred.append(probs.argmax(dim=-1).cpu().numpy().astype(np.int64))
+                    multiclass_conf.append(probs.max(dim=-1).values.cpu().numpy().astype(np.float32))
 
-            if getattr(model, "num_mod_classes", 1) == 1:
-                probs = torch.sigmoid(interpolated.squeeze(-1))
-                flat_true = mod_targets_cpu[valid_mask].numpy().astype(np.int64)
-                flat_prob = probs[valid_mask].numpy().astype(np.float32)
-                binary_true.append(flat_true)
-                binary_prob.append(flat_prob)
-            else:
-                probs = torch.softmax(interpolated, dim=-1)
-                pred = probs.argmax(dim=-1)
-                conf = probs.max(dim=-1).values
-                flat_true = mod_targets_cpu[valid_mask].numpy().astype(np.int64)
-                flat_pred = pred[valid_mask].numpy().astype(np.int64)
-                flat_conf = conf[valid_mask].numpy().astype(np.float32)
-                multiclass_true.append(flat_true)
-                multiclass_pred.append(flat_pred)
-                multiclass_conf.append(flat_conf)
+            for local_idx, sample_record in enumerate(projection["sample_records"]):
+                mod_alignment_records.append({
+                    "chunk_index": global_chunk_index + local_idx,
+                    **sample_record,
+                })
 
-            if len(mod_site_examples) < args.site_report_limit:
-                remaining = args.site_report_limit - len(mod_site_examples)
-                for sample_idx in range(len(lengths_cpu)):
-                    if remaining <= 0:
-                        break
-                    valid_positions = torch.nonzero(valid_mask[sample_idx], as_tuple=False).flatten().tolist()
-                    for pos in valid_positions:
-                        if remaining <= 0:
-                            break
-                        ref_token = int(targets_cpu[sample_idx, pos].item())
-                        ref_base = model.alphabet[ref_token] if 0 <= ref_token < len(model.alphabet) else str(ref_token)
-                        if getattr(model, "num_mod_classes", 1) == 1:
-                            prob = float(probs[sample_idx, pos].item())
-                            pred_label = int(prob >= args.mod_threshold)
-                            score = prob
-                        else:
-                            pred_label = int(pred[sample_idx, pos].item())
-                            score = float(conf[sample_idx, pos].item())
-                        mod_site_examples.append({
-                            "chunk_index": global_chunk_index + sample_idx,
-                            "target_pos": int(pos),
-                            "ref_base": ref_base,
-                            "true_mod": int(mod_targets_cpu[sample_idx, pos].item()),
-                            "pred_mod": pred_label,
-                            "score": score,
-                        })
-                        remaining -= 1
+            for site_record in projection["site_records"]:
+                mod_site_examples.append({
+                    "chunk_index": global_chunk_index + int(site_record["sample_index_in_batch"]),
+                    **site_record,
+                })
+
+            for local_idx, prediction in enumerate(per_base_predictions):
+                if len(predicted_base_examples) >= args.max_examples:
+                    break
+                if getattr(model, "num_mod_classes", 1) == 1:
+                    score_preview = prediction["mod_probs"][:40]
+                    pred_preview = prediction["mod_preds"][:40]
+                else:
+                    score_preview = [max(row) for row in prediction["mod_probs"][:40]]
+                    pred_preview = prediction["mod_preds"][:40]
+                predicted_base_examples.append({
+                    "chunk_index": global_chunk_index + local_idx,
+                    "predicted_base_len": len(prediction["sequence"]),
+                    "sequence_prefix": prediction["sequence"][:80],
+                    "first_20_time_steps": json.dumps(prediction["emit_positions"][:20]),
+                    "first_40_mod_scores": json.dumps(score_preview),
+                    "first_40_mod_preds": json.dumps(pred_preview),
+                })
 
             global_chunk_index += len(seqs)
 
     base_df = pd.DataFrame(base_records)
+    alignment_df = pd.DataFrame(mod_alignment_records)
     if base_df.empty:
         raise RuntimeError("No evaluation records were produced.")
 
@@ -601,6 +616,29 @@ def main(args):
         "del_rate": safe_div(base_df["num_deletions"].sum(), max(base_df["num_correct"].sum(), 1)),
     }
 
+    if alignment_df.empty:
+        warnings.append("No target-axis projection records were produced for the modification branch.")
+        alignment_summary = {
+            "mean_target_coverage": 0.0,
+            "mean_predicted_base_coverage": 0.0,
+            "mean_valid_mod_coverage": 0.0,
+            "mean_predicted_base_len": 0.0,
+            "mean_target_len": 0.0,
+        }
+    else:
+        alignment_summary = {
+            "mean_target_coverage": float(alignment_df["target_coverage"].mean()),
+            "mean_predicted_base_coverage": float(alignment_df["predicted_base_coverage"].mean()),
+            "mean_valid_mod_coverage": float(alignment_df["valid_mod_coverage"].mean()),
+            "mean_predicted_base_len": float(alignment_df["predicted_base_len"].mean()),
+            "mean_target_len": float(alignment_df["target_len"].mean()),
+        }
+        if alignment_summary["mean_valid_mod_coverage"] < 0.5:
+            warnings.append(
+                "Per-base target-axis projection is covering fewer than half of valid modification sites on average. "
+                "This usually means base predictions and references are still too far apart for stable mod supervision."
+            )
+
     num_mod_classes = getattr(model, "num_mod_classes", 1)
     if num_mod_classes == 1:
         y_true = np.concatenate(binary_true) if binary_true else np.array([], dtype=np.int64)
@@ -610,9 +648,11 @@ def main(args):
             "threshold": args.mod_threshold,
             **compute_binary_mod_metrics(y_true, y_prob, args.mod_threshold),
         }
-        if mod_summary["num_positive"] == 0 or mod_summary["num_negative"] == 0:
+        if mod_summary["num_sites"] == 0:
+            warnings.append("No aligned valid modification sites were available for evaluation.")
+        elif mod_summary["num_positive"] == 0 or mod_summary["num_negative"] == 0:
             warnings.append(
-                "All valid modification labels belong to one class. ROC-AUC/PR-AUC are undefined, and this dataset "
+                "All aligned valid modification labels belong to one class. ROC-AUC/PR-AUC are undefined, and this dataset "
                 "cannot teach a real modified-vs-unmodified decision boundary on its own."
             )
     else:
@@ -623,6 +663,8 @@ def main(args):
             "task_type": "multiclass",
             **compute_multiclass_mod_metrics(y_true, y_pred, y_conf, num_mod_classes),
         }
+        if mod_summary["num_sites"] == 0:
+            warnings.append("No aligned valid modification sites were available for evaluation.")
 
     summary = {
         "model_directory": str(Path(args.model_directory).resolve()),
@@ -631,6 +673,7 @@ def main(args):
         "weights": "last" if args.weights is None else args.weights,
         "num_chunks": int(len(base_df)),
         "base": base_summary,
+        "alignment": alignment_summary,
         "modification": mod_summary,
         "warnings": warnings,
     }
@@ -638,6 +681,8 @@ def main(args):
     base_df.to_csv(output_dir / "base_alignments.tsv", sep="\t", index=False)
     pd.DataFrame(sequence_examples).to_csv(output_dir / "sequence_examples.tsv", sep="\t", index=False)
     pd.DataFrame(mod_site_examples).to_csv(output_dir / "mod_site_examples.tsv", sep="\t", index=False)
+    alignment_df.to_csv(output_dir / "mod_alignment_summary.tsv", sep="\t", index=False)
+    pd.DataFrame(predicted_base_examples).to_csv(output_dir / "predicted_base_examples.tsv", sep="\t", index=False)
     with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
     (output_dir / "summary.txt").write_text(build_text_summary(summary), encoding="utf-8")
