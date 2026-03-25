@@ -284,3 +284,16 @@ bonito train_mod -f /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_a
   --chunks 68 \
   --valid-chunks 4 \
   --device cuda:0
+
+# validate
+
+python validate/evaluate_train_mod.py \
+  --model_directory /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_allmod_ft_crf \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mod/dataset \
+  --dataset valid \
+  --weights 10 \
+  --chunks 68 \
+  --valid-chunks 4 \
+  --batchsize 4 \
+  --device cuda:0 \
+  --output-dir /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_allmod_ft_crf/validate_epoch10
