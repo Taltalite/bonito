@@ -2,11 +2,13 @@
 """
 Bonito Dataset Generator V8 (Correct Signal-Order Alignment)
 
-Fixes from V7:
-1. CRITICAL: Correctly maps BAM Query Indices to Signal Indices.
-   - For Reverse Strand reads, BAM q_pos 0 is the LAST base of the physical signal.
-   - This fixes REV_COMP and SHIFT issues on reverse reads.
-2. Maintains Strict NM filtering and Left-Drop Chunking.
+Supports both DNA/cDNA and direct RNA training-data generation from
+Dorado-style BAM + POD5 inputs.
+
+Key rules:
+1. Labels are always written in physical signal order.
+2. DNA/cDNA and direct RNA use different BAM-query -> signal index mappings.
+3. Only POD5 raw input is supported in this repository workflow.
 """
 from __future__ import annotations
 
@@ -26,14 +28,31 @@ import pysam
 from tqdm import tqdm
 import shutil
 
-# 1-based encoding: 0=Pad, 1=A, 2=C, 3=G, 4=T
-BASE_TO_INT = {"A": 1, "C": 2, "G": 3, "T": 4}
-COMPLEMENT = str.maketrans("ACGT", "TGCA")
+# 1-based encoding: 0=Pad, 1=A, 2=C, 3=G, 4=T/U
+BASE_TO_INT = {"A": 1, "C": 2, "G": 3, "T": 4, "U": 4}
+COMPLEMENT = str.maketrans("ACGTU", "TGCAA")
 MAX_OPEN_POD5_PER_WORKER = 32
 EPS = 1e-5
 
 def complement_base(base: str) -> str:
     return base.upper().translate(COMPLEMENT)
+
+
+def query_pos_to_signal_idx(q_pos: int, read_length: int, is_reverse: bool, sample_type: str) -> int:
+    """
+    Map a BAM query index to the physical signal-order base index.
+
+    For DNA/cDNA, reverse-strand BAM records are reverse-complemented relative
+    to the pore order, so only reverse-strand reads need index reversal.
+
+    For direct RNA, Dorado/BAM query order is already reversed relative to the
+    pore order on forward-strand alignments. On reverse-strand alignments, the
+    SAM reverse-complement transform cancels that global reversal, so those
+    reads stay in signal order.
+    """
+    if sample_type == "rna":
+        return q_pos if is_reverse else read_length - 1 - q_pos
+    return read_length - 1 - q_pos if is_reverse else q_pos
 
 def normalize_ref_name(name: str) -> str:
     name = name.lower()
@@ -84,6 +103,7 @@ class TaskData:
     read_length: int
     reference_name: str
     is_reverse: bool
+    sample_type: str
     ts_tag: int
     mv_tag: Sequence[int]
     nm_tag: int
@@ -125,11 +145,42 @@ def get_pod5_reader(path):
         _, reader_to_close = cache.popitem(last=False)
         reader_to_close.close()
     try: new_reader = pod5.Reader(path)
-    except: 
+    except:
         time.sleep(0.1)
         new_reader = pod5.Reader(path)
     cache[path] = new_reader
     return new_reader
+
+
+def collect_pod5_paths(pod5_dir):
+    if not os.path.isdir(pod5_dir):
+        raise FileNotFoundError(f"POD5 directory does not exist: {pod5_dir}")
+
+    pod5_paths = []
+    fast5_paths = []
+    for root, _, files in os.walk(pod5_dir):
+        for name in files:
+            lower_name = name.lower()
+            full_path = os.path.join(root, name)
+            if lower_name.endswith(".pod5"):
+                pod5_paths.append(full_path)
+            elif lower_name.endswith(".fast5"):
+                fast5_paths.append(full_path)
+
+    if fast5_paths and pod5_paths:
+        raise ValueError(
+            f"Mixed raw formats found under {pod5_dir}. "
+            "This script only supports a pure .pod5 input set."
+        )
+    if fast5_paths and not pod5_paths:
+        raise ValueError(
+            f"Only .fast5 inputs were found under {pod5_dir}. "
+            "This script expects .pod5 input for the current Bonito workflow."
+        )
+    if not pod5_paths:
+        raise FileNotFoundError(f"No .pod5 files found under {pod5_dir}")
+
+    return sorted(pod5_paths)
 
 def fetch_calibrated_signal(read_id):
     if read_id not in WorkerState.pod5_lookup: raise KeyError("Read ID missing")
@@ -139,7 +190,11 @@ def fetch_calibrated_signal(read_id):
     pod5_read = batch.get_read(row_idx)
     cal = pod5_read.calibration
     raw = pod5_read.signal
+    if raw.ndim != 1 or raw.size == 0 or not np.issubdtype(raw.dtype, np.number):
+        raise ValueError(f"Invalid raw signal for read {read_id}")
     pa_signal = (raw.astype(np.float32) + cal.offset) * cal.scale
+    if pa_signal.ndim != 1 or pa_signal.size == 0:
+        raise ValueError(f"Empty calibrated signal for read {read_id}")
     return pa_signal, pod5_read
 
 def process_task(task: TaskData) -> Tuple[List[Sample], Dict[str, int]]:
@@ -170,19 +225,14 @@ def process_task(task: TaskData) -> Tuple[List[Sample], Dict[str, int]]:
         if q_pos is None or r_pos is None: continue
         
         try:
-            # pysam q_pos is index into the BAM SEQ.
-            # If is_reverse=True, BAM SEQ is Reverse Complemented relative to physical signal.
-            # So:
-            # - Physical Base 0  -> BAM SEQ Index (Length-1)
-            # - Physical Base N  -> BAM SEQ Index 0
-            #
-            # We want full_labels to be in PHYSICAL order to match 'mv' table.
-            
-            if task.is_reverse:
-                # Map BAM index to Signal index
-                signal_idx = task.read_length - 1 - q_pos
-            else:
-                signal_idx = q_pos
+            # Map BAM query order back into physical signal order. This differs
+            # between DNA/cDNA and direct RNA, so keep it explicit.
+            signal_idx = query_pos_to_signal_idx(
+                q_pos=q_pos,
+                read_length=task.read_length,
+                is_reverse=task.is_reverse,
+                sample_type=task.sample_type,
+            )
 
             # Safety check
             if signal_idx < 0 or signal_idx >= task.read_length: continue
@@ -270,10 +320,7 @@ def process_task(task: TaskData) -> Tuple[List[Sample], Dict[str, int]]:
 # [Boilerplate continues same as before...]
 def build_pod5_lookup(pod5_dir):
     lookup = {}
-    pod5_paths = []
-    for root, _, files in os.walk(pod5_dir):
-        for name in files:
-            if name.endswith(".pod5"): pod5_paths.append(os.path.join(root, name))
+    pod5_paths = collect_pod5_paths(pod5_dir)
     for pod5_path in tqdm(pod5_paths, desc="Indexing POD5"):
         with pod5.Reader(pod5_path) as reader:
             for batch_idx in range(reader.batch_count):
@@ -378,6 +425,7 @@ def parse_args():
     parser.add_argument("--pod5-dir", required=True)
     parser.add_argument("--reference-fasta", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--sample-type", choices=["dna", "rna"], default="dna")
     parser.add_argument("--chunk-len", type=int, default=12000)
     parser.add_argument("--overlap", type=int, default=600)
     parser.add_argument("--stride", type=int, default=None)
@@ -398,6 +446,7 @@ def main():
     temp_dir = os.path.join(args.output_dir, "temp_chunks")
     os.makedirs(temp_dir, exist_ok=True)
     stride = args.stride if args.stride else args.chunk_len - args.overlap
+    print(f"[config] sample_type={args.sample_type}")
     print("[1/5] Building POD5 index...")
     lookup = build_pod5_lookup(args.pod5_dir)
     print(f"      Found {len(lookup)} reads.")
@@ -423,6 +472,7 @@ def main():
             task = TaskData(
                 read_id=read.query_name, read_length=read.query_length,
                 reference_name=read.reference_name, is_reverse=read.is_reverse,
+                sample_type=args.sample_type,
                 ts_tag=read.get_tag("ts") if read.has_tag("ts") else 0,
                 mv_tag=read.get_tag("mv"), nm_tag=read.get_tag("NM") if read.has_tag("NM") else None,
                 signal_len_arg=args.chunk_len, stride_arg=stride, overlap_arg=args.overlap,

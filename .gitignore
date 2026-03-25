@@ -31,3 +31,4 @@ tmp/
 .vscode/
 *nsys-rep
 *.egg-info/
+.tmp_*/

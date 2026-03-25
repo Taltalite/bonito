@@ -212,3 +212,24 @@ minimap2 -ax map-ont -t 16 --secondary=no /data/biolab-nvme-pcie2/lijy/HG002/hg3
 samtools sort -o ./bonito_r10_sup@v5.2.0_bonitoft_aligned.bam
 
 samtools index ./bonito_r10_sup@v5.2.0_bonitoft_aligned.bam
+
+
+
+
+python -m bonito finetune -f /data/biolab-nvme-pcie2/lijy/HG002/bonito_models/bonito_r10_sup@v5.2.0_doradov8dataset_ft_test \
+ --directory /data/biolab-nvme-pcie2/lijy/HG002/dataset/pod5_10_dorado_v8/ \
+ --pretrained /home/lijy/workspace/bonito/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0/ \
+ --epochs 30 \
+ --chunks 30000 \
+ --valid-chunks 3000 \
+ --batch 32 \
+ --lr 1e-4 \
+ --config /home/lijy/workspace/bonito/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0_finetune/config.toml
+
+python -m bonito basecaller \
+ /home/lijy/workspace/bonito/bonito/models/test/ \
+ --device cuda:0 \
+ --max-reads 100 \
+ --no-use-koi \
+ /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1 \
+ > /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1_testcalled/bonito_sup/v8ft_test/bonito_r10_sup@v5.2.0_v8ft_test.bam
