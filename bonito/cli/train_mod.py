@@ -71,6 +71,17 @@ def apply_freeze_settings(model, args):
             freeze_parameters(model.encoder.conv)
             frozen.append("encoder.conv")
 
+    if args.freeze_base_head:
+        if hasattr(model, "crf"):
+            freeze_parameters(model.crf)
+            frozen.append("crf")
+        elif hasattr(model, "encoder") and hasattr(model.encoder, "crf"):
+            freeze_parameters(model.encoder.crf)
+            frozen.append("encoder.crf")
+        elif hasattr(model, "base_decoder"):
+            freeze_parameters(model.base_decoder)
+            frozen.append("base_decoder")
+
     if args.freeze_encoder:
         if hasattr(model, "encoder_layers"):
             for layer in model.encoder_layers:
@@ -191,6 +202,7 @@ def argparser():
     parser.add_argument('--config', default=default_config)
     parser.add_argument('--pretrained', default="")
     parser.add_argument("--freeze-conv", action="store_true", default=False)
+    parser.add_argument("--freeze-base-head", action="store_true", default=False)
     parser.add_argument("--freeze-encoder", action="store_true", default=False)
     parser.add_argument("--freeze-encoder-layers", type=int, default=0)
     parser.add_argument("--directory", type=Path)
