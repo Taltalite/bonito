@@ -33,3 +33,6 @@ tmp/
 *.egg-info/
 .tmp_*/
 log/
+
+
+validate/res/

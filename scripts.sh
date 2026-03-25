@@ -296,4 +296,33 @@ python validate/evaluate_train_mod.py \
   --valid-chunks 4 \
   --batchsize 4 \
   --device cuda:0 \
-  --output-dir /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_allmod_ft_crf/validate_epoch10
+  --output-dir /home/lijy/workspace/bonito/validate/res/rna004_m6a_allmod_ft_crf/validate_epoch10
+
+
+# single file finetuned
+
+bonito train_mod -f /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_allmod_1file_ft_crf \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mod/dataset \
+  --config /home/lijy/workspace/bonito/bonito/models/multihead_transformer/config.toml \
+  --pretrained rna004_130bps_sup@v5.2.0 \
+  --freeze-conv \
+  --freeze-base-head \
+  --freeze-encoder \
+  --epochs 30 \
+  --lr 5e-5 \
+  --batch 64 \
+  --chunks 12346 \
+  --valid-chunks 1234 \
+  --device cuda:0 \
+    > /home/lijy/workspace/bonito/log/rna004_m6a_allmod_ft_1file_crf.log 2>&1
+
+python validate/evaluate_train_mod.py \
+  --model_directory /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_allmod_1file_ft_crf \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mod/dataset \
+  --dataset valid \
+  --weights 30 \
+  --chunks 12346 \
+  --valid-chunks 1234 \
+  --batchsize 16 \
+  --device cuda:0 \
+  --output-dir /home/lijy/workspace/bonito/validate/res/rna004_m6a_allmod_ft_crf/validate_1file_epoch30
