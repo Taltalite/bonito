@@ -87,7 +87,7 @@ python -m bonito train_mod -f /data/biolab-nvme-pcie2/lijy/HG002/multihead_model
  --config /home/lijy/workspace/bonito/bonito/models/configs/multihead_transformer.toml \
  --pretrained /home/lijy/workspace/bonito-uv/bonito/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0/ \
  --freeze-conv \
- --directory /data/biolab-nvme-pcie2/lijy/HG002/dataset/pod5_10_dorado_v8/ \
+ --directory /data/biolab-nvme-pcie2/lijy/HG002/dataset/pod5_10_dorado_v8  / \
  --device cuda:0 \
  --epochs 20 \
  --lr 1e-4 \
@@ -233,3 +233,22 @@ python -m bonito basecaller \
  --no-use-koi \
  /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1 \
  > /data/biolab-nvme-pcie2/lijy/HG002/pod5_pass_1_testcalled/bonito_sup/v8ft_test/bonito_r10_sup@v5.2.0_v8ft_test.bam
+
+
+
+# =========================== 2026 03 25 ===================================
+
+
+bonito train_mod  -f  /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_allmod_ft \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mod/dataset \
+  --config /home/lijy/workspace/bonito/bonito/models/multihead_transformer/config.toml \
+  --pretrained rna004_130bps_sup@v5.2.0 \
+  --freeze-conv \
+  --freeze-encoder \
+  --epochs 10 \
+  --lr 5e-5 \
+  --batch 8 \
+  --chunks 12346 \
+  --valid-chunks 1234 \
+  --num-workers 8 \
+  --device cuda:0
