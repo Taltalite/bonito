@@ -28,7 +28,6 @@ import pandas as pd
 import parasail
 import torch
 import torch.amp as amp
-import torch.nn.functional as F
 from tqdm import tqdm
 
 from bonito.data import ComputeSettings, DataSettings, ModelSetup, load_mod_data
@@ -90,12 +89,6 @@ def align(ref: str, seq: str) -> AlignResult:
         align_seq_start=seq_start,
         align_seq_end=res.end_query,
     )
-
-
-def interpolate_mod_logits(mod_logits: torch.Tensor, target_width: int) -> torch.Tensor:
-    mod_logits = mod_logits.permute(0, 2, 1)
-    mod_logits = F.interpolate(mod_logits, size=target_width, mode="linear", align_corners=False)
-    return mod_logits.permute(0, 2, 1)
 
 
 def confusion_matrix(true_labels: np.ndarray, pred_labels: np.ndarray, num_classes: int) -> np.ndarray:
@@ -392,6 +385,138 @@ def save_training_curves(model_directory: Path, output_dir: Path) -> List[str]:
     return written
 
 
+def save_alignment_projection_plots(alignment_df: pd.DataFrame, base_df: pd.DataFrame, output_dir: Path) -> List[str]:
+    written = []
+    if plt is None or alignment_df.empty:
+        return written
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    axes[0].hist(alignment_df["target_coverage"], bins=25, alpha=0.7, label="target coverage", color="#1f77b4")
+    axes[0].hist(alignment_df["valid_mod_coverage"], bins=25, alpha=0.7, label="valid mod coverage", color="#d62728")
+    axes[0].set_title("Per-base Projection Coverage")
+    axes[0].set_xlabel("Coverage")
+    axes[0].set_ylabel("Chunks")
+    axes[0].legend()
+
+    if not base_df.empty and "accuracy_pct" in base_df.columns:
+        axes[1].scatter(base_df["accuracy_pct"], alignment_df["valid_mod_coverage"], s=14, alpha=0.7, color="#2ca02c")
+        axes[1].set_xlabel("Base accuracy (%)")
+    else:
+        axes[1].scatter(np.arange(len(alignment_df)), alignment_df["valid_mod_coverage"], s=14, alpha=0.7, color="#2ca02c")
+        axes[1].set_xlabel("Chunk index")
+    axes[1].set_title("Valid Mod Coverage vs Base Accuracy")
+    axes[1].set_ylabel("Valid mod coverage")
+
+    fig.tight_layout()
+    path = output_dir / "mod_alignment_coverage.png"
+    fig.savefig(path, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+    written.append(path.name)
+    return written
+
+
+def _downsample_trace(x: np.ndarray, y: np.ndarray, max_points: int) -> Tuple[np.ndarray, np.ndarray]:
+    if len(x) <= max_points:
+        return x, y
+    idx = np.linspace(0, len(x) - 1, num=max_points, dtype=np.int64)
+    return x[idx], y[idx]
+
+
+def save_signal_alignment_examples(signal_examples: List[Dict[str, object]], output_dir: Path, stride: int) -> List[str]:
+    written = []
+    if plt is None or not signal_examples:
+        return written
+
+    for example in signal_examples:
+        signal = np.asarray(example["signal"], dtype=np.float32)
+        if signal.size == 0:
+            continue
+
+        x = np.arange(signal.size, dtype=np.int64)
+        plot_x, plot_signal = _downsample_trace(x, signal, max_points=4000)
+        signal_max = float(np.max(signal))
+        signal_span = max(signal_max - float(np.min(signal)), 1e-6)
+
+        emit_positions = np.asarray(example["emit_positions"], dtype=np.int64)
+        emit_signal_positions = emit_positions * int(stride)
+        mod_probs = np.asarray(example["mod_probs"], dtype=np.float32)
+        base_labels = list(example["base_labels"])
+        site_records = list(example["site_records"])
+
+        fig, axes = plt.subplots(2, 1, figsize=(15, 8), gridspec_kw={"height_ratios": [2.2, 1.2]})
+
+        axes[0].plot(plot_x, plot_signal, linewidth=0.8, color="#4c566a")
+        axes[0].set_title(
+            f"Chunk {example['chunk_index']} Signal / Base / Mod Alignment\n"
+            f"pred_len={example['predicted_base_len']} target_len={example['target_len']} "
+            f"target_cov={example['target_coverage']:.3f} valid_mod_cov={example['valid_mod_coverage']:.3f}"
+        )
+        axes[0].set_ylabel("Current")
+
+        if emit_signal_positions.size:
+            clipped_positions = np.clip(emit_signal_positions, 0, signal.size - 1)
+            emit_signal_values = signal[clipped_positions]
+            scatter = axes[0].scatter(
+                clipped_positions,
+                emit_signal_values,
+                c=mod_probs if mod_probs.size else np.zeros_like(clipped_positions, dtype=np.float32),
+                cmap="coolwarm",
+                s=18,
+                alpha=0.85,
+                edgecolors="none",
+                vmin=0.0,
+                vmax=1.0,
+            )
+            cbar = fig.colorbar(scatter, ax=axes[0], pad=0.01)
+            cbar.set_label("Predicted mod probability")
+
+            label_limit = min(len(base_labels), 40)
+            label_stride = max(label_limit // 20, 1)
+            for idx in range(0, label_limit, label_stride):
+                x_pos = int(clipped_positions[idx])
+                y_pos = float(emit_signal_values[idx]) + 0.04 * signal_span
+                axes[0].text(x_pos, y_pos, str(base_labels[idx]), fontsize=7, ha="center", va="bottom", rotation=90)
+
+        true_mod_x = []
+        true_mod_y = []
+        true_mod_colors = []
+        for record in site_records:
+            raw_x = int(record["time_step"]) * int(stride)
+            raw_x = max(0, min(raw_x, signal.size - 1))
+            true_mod_x.append(raw_x)
+            true_mod_y.append(signal_max + 0.15 * signal_span)
+            true_mod_colors.append("#d62728" if int(record["true_mod"]) == 1 else "#1f77b4")
+        if true_mod_x:
+            axes[0].scatter(true_mod_x, true_mod_y, marker="v", c=true_mod_colors, s=30, alpha=0.9, label="target mod labels")
+            axes[0].legend(loc="upper right")
+
+        base_index = np.arange(len(base_labels), dtype=np.int64)
+        if len(base_labels):
+            axes[1].plot(base_index, mod_probs if mod_probs.size else np.zeros(len(base_labels), dtype=np.float32), color="#2ca02c", linewidth=1.1)
+            axes[1].scatter(base_index, mod_probs if mod_probs.size else np.zeros(len(base_labels), dtype=np.float32), color="#2ca02c", s=12)
+
+        aligned_pred_indices = [int(record["predicted_base_index"]) for record in site_records]
+        aligned_true_mod = [int(record["true_mod"]) for record in site_records]
+        if aligned_pred_indices:
+            y_vals = [mod_probs[idx] if idx < len(mod_probs) else 0.0 for idx in aligned_pred_indices]
+            colors = ["#d62728" if value == 1 else "#1f77b4" for value in aligned_true_mod]
+            axes[1].scatter(aligned_pred_indices, y_vals, marker="D", c=colors, s=28, alpha=0.95, label="aligned target mod labels")
+            axes[1].legend(loc="upper right")
+
+        axes[1].set_title("Per-base Modification Scores on Predicted Base Axis")
+        axes[1].set_xlabel("Predicted base index")
+        axes[1].set_ylabel("Mod probability")
+        axes[1].set_ylim(-0.05, 1.05)
+
+        fig.tight_layout()
+        path = output_dir / f"signal_mod_alignment_chunk_{int(example['chunk_index'])}.png"
+        fig.savefig(path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+        written.append(path.name)
+
+    return written
+
+
 def build_text_summary(summary: Dict[str, object]) -> str:
     base = summary["base"]
     alignment = summary["alignment"]
@@ -488,6 +613,7 @@ def main(args):
     mod_site_examples: List[Dict[str, object]] = []
     mod_alignment_records: List[Dict[str, object]] = []
     predicted_base_examples: List[Dict[str, object]] = []
+    signal_examples: List[Dict[str, object]] = []
 
     binary_true: List[np.ndarray] = []
     binary_prob: List[np.ndarray] = []
@@ -502,6 +628,7 @@ def main(args):
     with torch.no_grad():
         for batch in tqdm(dataloader, total=len(dataloader), ascii=True, ncols=100, desc="evaluating"):
             data, targets, lengths, mod_targets, *extra = batch
+            data_cpu = data.detach().cpu()
             data = data.to(args.device, dtype=model_dtype, non_blocking=True)
             targets_device = targets.to(args.device, non_blocking=True)
             lengths_device = lengths.to(args.device, non_blocking=True)
@@ -578,22 +705,44 @@ def main(args):
                 })
 
             for local_idx, prediction in enumerate(per_base_predictions):
-                if len(predicted_base_examples) >= args.max_examples:
-                    break
-                if getattr(model, "num_mod_classes", 1) == 1:
-                    score_preview = prediction["mod_probs"][:40]
-                    pred_preview = prediction["mod_preds"][:40]
-                else:
-                    score_preview = [max(row) for row in prediction["mod_probs"][:40]]
-                    pred_preview = prediction["mod_preds"][:40]
-                predicted_base_examples.append({
-                    "chunk_index": global_chunk_index + local_idx,
-                    "predicted_base_len": len(prediction["sequence"]),
-                    "sequence_prefix": prediction["sequence"][:80],
-                    "first_20_time_steps": json.dumps(prediction["emit_positions"][:20]),
-                    "first_40_mod_scores": json.dumps(score_preview),
-                    "first_40_mod_preds": json.dumps(pred_preview),
-                })
+                if len(predicted_base_examples) < args.max_examples:
+                    if getattr(model, "num_mod_classes", 1) == 1:
+                        score_preview = prediction["mod_probs"][:40]
+                        pred_preview = prediction["mod_preds"][:40]
+                    else:
+                        score_preview = [max(row) for row in prediction["mod_probs"][:40]]
+                        pred_preview = prediction["mod_preds"][:40]
+                    predicted_base_examples.append({
+                        "chunk_index": global_chunk_index + local_idx,
+                        "predicted_base_len": len(prediction["sequence"]),
+                        "sequence_prefix": prediction["sequence"][:80],
+                        "first_20_time_steps": json.dumps(prediction["emit_positions"][:20]),
+                        "first_40_mod_scores": json.dumps(score_preview),
+                        "first_40_mod_preds": json.dumps(pred_preview),
+                    })
+
+                if len(signal_examples) < args.signal_example_limit:
+                    sample_sites = [
+                        dict(site_record)
+                        for site_record in projection["site_records"]
+                        if int(site_record["sample_index_in_batch"]) == local_idx
+                    ]
+                    if sample_sites:
+                        signal_examples.append({
+                            "chunk_index": global_chunk_index + local_idx,
+                            "signal": data_cpu[local_idx].reshape(-1).numpy().tolist(),
+                            "emit_positions": list(prediction["emit_positions"]),
+                            "base_labels": list(prediction["base_labels"]),
+                            "mod_probs": [
+                                float(x) if not isinstance(x, list) else float(max(x))
+                                for x in prediction["mod_probs"]
+                            ],
+                            "site_records": sample_sites,
+                            "predicted_base_len": len(prediction["sequence"]),
+                            "target_len": int(projection["sample_records"][local_idx]["target_len"]),
+                            "target_coverage": float(projection["sample_records"][local_idx]["target_coverage"]),
+                            "valid_mod_coverage": float(projection["sample_records"][local_idx]["valid_mod_coverage"]),
+                        })
 
             global_chunk_index += len(seqs)
 
@@ -689,6 +838,7 @@ def main(args):
 
     written_plots: List[str] = []
     written_plots.extend(save_base_plots(base_df, output_dir))
+    written_plots.extend(save_alignment_projection_plots(alignment_df, base_df, output_dir))
     if num_mod_classes == 1:
         y_true = np.concatenate(binary_true) if binary_true else np.array([], dtype=np.int64)
         y_prob = np.concatenate(binary_prob) if binary_prob else np.array([], dtype=np.float32)
@@ -697,6 +847,7 @@ def main(args):
         confusion = np.array(summary["modification"]["confusion_matrix"], dtype=np.int64)
         written_plots.extend(save_multiclass_mod_plot(confusion, output_dir))
     written_plots.extend(save_training_curves(Path(args.model_directory), output_dir))
+    written_plots.extend(save_signal_alignment_examples(signal_examples, output_dir, stride=getattr(model, "stride", 1)))
 
     if plt is not None and not written_plots:
         warnings.append("No PNG plots were written. Check whether evaluation arrays were empty or training.csv was missing.")
@@ -725,6 +876,7 @@ def argparser():
     parser.add_argument("--mod-threshold", type=float, default=0.5)
     parser.add_argument("--max-examples", type=int, default=100)
     parser.add_argument("--site-report-limit", type=int, default=20000)
+    parser.add_argument("--signal-example-limit", type=int, default=6, help="How many per-chunk signal/base/mod alignment plots to save.")
     parser.add_argument("--standardise", action="store_true", default=False)
     parser.add_argument("--no-amp", action="store_true", default=False)
     parser.add_argument("--no-half", action="store_true", default=False)
