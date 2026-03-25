@@ -252,3 +252,35 @@ bonito train_mod  -f  /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a
   --valid-chunks 1234 \
   --num-workers 8 \
   --device cuda:0
+
+
+# 小chunk排查问题
+
+bonito train_mod -f  /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_allmod_ft_test \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mod/dataset \
+  --config /home/lijy/workspace/bonito/bonito/models/multihead_transformer/config.toml \
+  --pretrained rna004_130bps_sup@v5.2.0 \
+  --epochs 10 \
+  --lr 1e-4 \
+  --batch 8 \
+  --chunks 68 \
+  --valid-chunks 4 \
+  --device cuda:0 \
+  > /home/lijy/workspace/bonito/log/rna004_m6a_allmod_ft_test_260325.log 2>&1
+
+
+# 改到 base head 接 crf
+
+bonito train_mod -f /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_allmod_ft_crf \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mod/dataset \
+  --config /home/lijy/workspace/bonito/bonito/models/multihead_transformer/config.toml \
+  --pretrained rna004_130bps_sup@v5.2.0 \
+  --freeze-conv \
+  --freeze-base-head \
+  --freeze-encoder \
+  --epochs 10 \
+  --lr 1e-4 \
+  --batch 8 \
+  --chunks 68 \
+  --valid-chunks 4 \
+  --device cuda:0

@@ -32,3 +32,4 @@ tmp/
 *nsys-rep
 *.egg-info/
 .tmp_*/
+log/
