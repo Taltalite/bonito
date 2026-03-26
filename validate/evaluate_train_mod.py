@@ -477,23 +477,24 @@ def save_signal_alignment_examples(signal_examples: List[Dict[str, object]], out
                 vmax=1.0,
                 label="pred bases",
             )
-            cbar = fig.colorbar(scatter, ax=ax_signal, pad=0.01)
-            cbar.set_label("Predicted mod probability")
+            # cbar = fig.colorbar(scatter, ax=ax_signal, pad=0.01)
+            # cbar.set_label("Predicted mod probability")
 
             label_limit = min(len(base_labels), 40)
             label_stride = max(label_limit // 20, 1)
-            label_y = signal_max + 0.04 * signal_span
-            for idx in range(0, label_limit, label_stride):
-                ax_signal.text(
-                    int(emit_signal_positions[idx]),
-                    label_y,
-                    str(base_labels[idx]),
-                    fontsize=7,
-                    ha="center",
-                    va="bottom",
-                    rotation=90,
-                    color="#2e3440",
-                )
+            # label_y = signal_max + 0.04 * signal_span
+            # label_y = signal_min - 0.15 
+            # for idx in range(0, label_limit, label_stride):
+            #     ax_signal.text(
+            #         int(emit_signal_positions[idx]),
+            #         label_y,
+            #         str(base_labels[idx]),
+            #         fontsize=10,
+            #         ha="center",
+            #         va="bottom",
+            #         rotation=90,
+            #         color="#2e3440",
+            #     )
 
         if site_records:
             aligned_x = np.asarray([
@@ -540,8 +541,8 @@ def save_signal_alignment_examples(signal_examples: List[Dict[str, object]], out
                 x_pos = int(aligned_x[idx])
                 ref_text = f"{record['ref_base']}:{int(record['true_mod'])}"
                 pred_text = f"p:{int(record['pred_mod'])}"
-                ax_mod.text(x_pos, 1.16, ref_text, fontsize=7, ha="center", va="bottom", rotation=90, color="#5e81ac")
-                ax_mod.text(x_pos, min(float(pred_scores[idx]) + 0.06, 1.02), pred_text, fontsize=7, ha="center", va="bottom", rotation=90, color="#bf616a")
+                ax_mod.text(x_pos, 1.16, ref_text, fontsize=10, ha="center", va="bottom", rotation=90, color="#5e81ac")
+                ax_mod.text(x_pos, min(float(pred_scores[idx]) + 0.06, 1.02), pred_text, fontsize=10, ha="center", va="bottom", rotation=90, color="#bf616a")
 
         signal_handles, signal_labels = ax_signal.get_legend_handles_labels()
         mod_handles, mod_labels = ax_mod.get_legend_handles_labels()
