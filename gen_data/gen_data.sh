@@ -14,3 +14,8 @@ python create_dataset_mpv8.py \
 
 python make_mod_targets_m6a.py \
     --dataset-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mod/dataset/
+
+
+
+# basecalling
+
