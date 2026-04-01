@@ -355,3 +355,21 @@ python validate/evaluate_train_mod.py \
   --device cuda:0 \
   --signal-example-limit 8 \
   --output-dir /home/lijy/workspace/bonito/validate/res/rna004_m6a_allmod_ft_crf/validate_1file_baselevel_epoch20
+
+
+
+# mod trunk + 4 base mod head
+
+bonito train_mod -f /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_15+15_ft \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_15wmod+15wcan \
+  --config /home/lijy/workspace/bonito/bonito/models/configs/multihead_transformer.toml \
+  --pretrained rna004_130bps_sup@v5.2.0 \
+  --freeze-conv \
+  --freeze-encoder \
+  --freeze-base-head \
+  --epochs 30 \
+  --batch 48 \
+  --lr 5e-5 \
+  --chunks 300000 \
+  --valid-chunks 20000 \
+  --device cuda:0

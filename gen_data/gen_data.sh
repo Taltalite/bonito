@@ -59,3 +59,11 @@ python make_mod_targets_m6a.py \
   --dataset-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/canonical_PAW51322_0f2f3583_34a338cb_0+10/ \
   --mode canonical \
   --non-a-policy ignore
+
+
+# merge to mix dataset
+
+python merge_mod_datasets.py \
+  --full-mod-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mod_PAW43156_92158b33_73a20312_0+10/ \
+  --canonical-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/canonical_PAW51322_0f2f3583_34a338cb_0+10/ \
+  --output-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_15wmod+15wcan

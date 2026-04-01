@@ -3,9 +3,37 @@
 This command trains a shared-encoder multi-head model that predicts:
 
 - a basecalled sequence from `base_logits`
-- base-aligned modification labels from `mod_logits`
+- base-aligned modification labels from a shared modification trunk plus
+  base-specific modification heads
 
 Use it for models such as [`bonito/transformer/multihead_model.py`](../bonito/transformer/multihead_model.py).
+
+## Model Architecture
+
+The current `multihead_model.py` implementation uses:
+
+- one shared encoder for basecalling and modification prediction
+- one shared modification trunk that consumes encoder features
+- one modification head per base slot listed in `model.mod_bases`
+
+With the default config, the model defines four base slots:
+
+- `A`
+- `C`
+- `G`
+- `T`
+
+and four corresponding heads:
+
+- `A` head: `["canonical_A", "m6A"]`
+- `C` head: `["canonical_C"]`
+- `G` head: `["canonical_G"]`
+- `T` head: `["canonical_T"]`
+
+So in the default m6A setup, only the `A` head has a real supervised
+modified-vs-canonical decision. The `C/G/T` heads exist so the model can keep a
+consistent global label space and base-slot mapping, but they do not contribute
+modification loss unless you configure additional classes for them.
 
 ## Directory Layout
 
@@ -62,12 +90,36 @@ Constraints checked by the loader:
 
 - One row per sample, aligned to the target sequence rather than to raw signal time steps.
 - Padding or ignored positions should use `-100` if you want them excluded from the modification loss.
-- For binary modification detection with `num_mod_classes = 1`:
-  - use `0` for unmodified
-  - use `1` for modified
-- For multi-class modification detection with `num_mod_classes > 1`:
-  - use class ids in `[0, num_mod_classes - 1]`
-  - use `-100` for ignored positions
+- Labels are global modification-label ids, not per-head local ids.
+- The available global ids are defined by `model.mod_global_labels`.
+- Each base slot maps a subset of those global ids into its own local head space
+  through `model.mod_head_defs`.
+- A target position contributes modification loss only if:
+  - its label is not `-100`
+  - the base at that target position maps to a configured base slot
+  - that slot's head contains more than one class
+  - the global label is assigned to that same slot
+
+For the default m6A config:
+
+- `0` = `canonical_A`
+- `1` = `canonical_C`
+- `2` = `canonical_G`
+- `3` = `canonical_T`
+- `4` = `m6A`
+
+Practical interpretation with the default config:
+
+- `A` positions should usually be labeled as either `canonical_A` (`0`) or `m6A` (`4`)
+- `C/G/T` positions may be labeled with their canonical global ids if you want a fully
+  populated target tensor
+- `C/G/T` positions can also be set to `-100` if you want them ignored for an m6A-only task
+
+Important:
+
+- do not use per-head local ids in `mod_targets.npy`
+- do not assume every non-ignored target position contributes mod loss
+- the valid prefix is still controlled by `reference_lengths.npy`
 
 In the current implementation, `target_lengths` defines the valid prefix for both base and modification targets.
 
@@ -94,24 +146,60 @@ dim_feedforward = 1024
 num_layers = 4
 kernel_size = 5
 stride = 2
-num_mod_classes = 1
 mod_task = "multilabel"
 mod_loss_weight = 1.0
+mod_target_projection = "viterbi_edlib_equal"
+mod_decode_projection = "viterbi_path"
+mod_bases = ["A", "C", "G", "T"]
+mod_global_labels = ["canonical_A", "canonical_C", "canonical_G", "canonical_T", "m6A"]
+mod_trunk_dim = 128
+mod_trunk_kernel_size = 5
+mod_trunk_depth = 1
+mod_head_dropout = 0.1
+
+[model.mod_head_defs]
+A = ["canonical_A", "m6A"]
+C = ["canonical_C"]
+G = ["canonical_G"]
+T = ["canonical_T"]
+
+[model.base_slot_aliases]
+T = ["T", "U"]
 
 [input]
 features = 1
-n_pre_post_context_bases = [3, 1]
+n_pre_post_context_bases = [0, 0]
 
 [labels]
 labels = ["", "A", "C", "G", "T"]
+
+[global_norm]
+state_len = 4
 ```
 
 Notes:
 
 - `model.file` is resolved relative to the config file directory.
-- `num_mod_classes = 1` selects binary modification loss.
-- `num_mod_classes > 1` selects multi-class modification loss.
+- `model.mod_global_labels` defines the shared global label vocabulary.
+- `model.mod_head_defs` defines which labels belong to each base-specific head.
+- The first label in each head must be that base's canonical label.
+- `model.base_slot_aliases` lets one slot accept multiple emitted base symbols, such as
+  `T` and `U` sharing the same head.
+- Heads with only one class are structurally present but do not contribute cross-entropy loss.
 - `mod_loss_weight` scales the modification loss contribution.
+
+## Label Mapping Example
+
+With the default config:
+
+- a reference `A` with canonical label `0` is routed to the `A` head as local class `0`
+- a reference `A` with m6A label `4` is routed to the `A` head as local class `1`
+- a reference `C` with canonical label `1` is routed to the `C` head as local class `0`
+- a reference `C` with label `4` is invalid for the `C` head and is ignored by the mod-loss projection
+
+This means `mod_targets.npy` should be thought of as a target-axis tensor in the
+shared global label space, while the model internally converts those labels into
+per-head local targets after aligning predicted bases back to the reference.
 
 ## Training Command
 
