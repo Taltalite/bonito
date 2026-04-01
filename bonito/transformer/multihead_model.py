@@ -16,6 +16,55 @@ from bonito.nn import LinearCRFEncoder, NamedSerial, TransformerEncoderLayer, fr
 
 
 _CIGAR_RE = re.compile(r"(\d+)([=XID])")
+DEFAULT_MOD_BASES = ("A", "C", "G", "T")
+DEFAULT_MOD_GLOBAL_LABELS = (
+    "canonical_A",
+    "canonical_C",
+    "canonical_G",
+    "canonical_T",
+    "m6A",
+)
+DEFAULT_MOD_HEAD_DEFS = {
+    "A": ["canonical_A", "m6A"],
+    "C": ["canonical_C"],
+    "G": ["canonical_G"],
+    "T": ["canonical_T"],
+}
+DEFAULT_BASE_SLOT_ALIASES = {
+    "T": ["T", "U"],
+}
+IGNORE_INDEX = -100
+
+
+class LightweightModBlock(torch.nn.Module):
+    def __init__(self, width: int, kernel_size: int, dropout: float):
+        super().__init__()
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(f"mod_trunk_kernel_size must be a positive odd integer, got {kernel_size}")
+
+        padding = kernel_size // 2
+        self.norm = torch.nn.LayerNorm(width)
+        self.linear = torch.nn.Linear(width, width)
+        self.depthwise = torch.nn.Conv1d(
+            width,
+            width,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=width,
+        )
+        self.pointwise = torch.nn.Conv1d(width, width, kernel_size=1)
+        self.dropout = torch.nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.norm(x)
+        x = F.gelu(self.linear(x))
+        x = x.transpose(1, 2)
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = x.transpose(1, 2)
+        x = self.dropout(x)
+        return residual + x
 
 
 class MultiHeadModel(torch.nn.Module):
@@ -93,7 +142,6 @@ class MultiHeadModel(torch.nn.Module):
                 permute=[1, 0, 2],
             )
 
-        self.num_mod_classes = model_cfg.get("num_mod_classes", 1)
         self.mod_task = model_cfg.get("mod_task", "multilabel")
         self.mod_loss_weight = model_cfg.get("mod_loss_weight", 1.0)
         self.mod_target_projection = model_cfg.get("mod_target_projection", "viterbi_edlib_equal")
@@ -103,16 +151,109 @@ class MultiHeadModel(torch.nn.Module):
         if self.mod_decode_projection != "viterbi_path":
             raise ValueError(f"Unsupported mod_decode_projection: {self.mod_decode_projection}")
 
-        self.mod_adapter = torch.nn.Linear(d_model, d_model // 2)
-        self.mod_decoder = torch.nn.Linear(d_model // 2, self.num_mod_classes)
+        self.mod_bases = [str(base).upper() for base in model_cfg.get("mod_bases", DEFAULT_MOD_BASES)]
+        self.mod_global_labels = list(model_cfg.get("mod_global_labels", DEFAULT_MOD_GLOBAL_LABELS))
+        if not self.mod_global_labels:
+            raise ValueError("model.mod_global_labels must not be empty")
+        self.global_label_to_id = {label: idx for idx, label in enumerate(self.mod_global_labels)}
+        if len(self.global_label_to_id) != len(self.mod_global_labels):
+            raise ValueError("model.mod_global_labels must be unique")
+
+        configured_aliases = model_cfg.get("base_slot_aliases", {})
+        self.base_slot_aliases = {base: [base] for base in self.mod_bases}
+        for base, aliases in DEFAULT_BASE_SLOT_ALIASES.items():
+            if base in self.base_slot_aliases:
+                self.base_slot_aliases[base] = [str(alias).upper() for alias in aliases]
+        for base, aliases in configured_aliases.items():
+            base_key = str(base).upper()
+            if base_key not in self.base_slot_aliases:
+                continue
+            self.base_slot_aliases[base_key] = [str(alias).upper() for alias in aliases]
+        self.base_label_to_slot = {}
+        for base, aliases in self.base_slot_aliases.items():
+            self.base_label_to_slot[base] = base
+            for alias in aliases:
+                self.base_label_to_slot[alias] = base
+
+        configured_head_defs = model_cfg.get("mod_head_defs", {})
+        self.mod_head_defs = {}
+        self.global_id_to_head_local = {}
+        self.head_global_ids = {}
+        self.head_display_names = {}
+        for base in self.mod_bases:
+            canonical_label = self._canonical_label(base)
+            head_labels = list(configured_head_defs.get(base, DEFAULT_MOD_HEAD_DEFS.get(base, [canonical_label])))
+            if not head_labels:
+                head_labels = [canonical_label]
+            if head_labels[0] != canonical_label:
+                raise ValueError(f"Head {base} must start with canonical label {canonical_label}")
+
+            local_global_ids = []
+            for local_idx, label in enumerate(head_labels):
+                if label not in self.global_label_to_id:
+                    raise ValueError(f"Head {base} uses undefined global mod label: {label}")
+                global_id = self.global_label_to_id[label]
+                if global_id in self.global_id_to_head_local:
+                    prev_base, _ = self.global_id_to_head_local[global_id]
+                    raise ValueError(f"Global mod label {label} is assigned to multiple heads: {prev_base}, {base}")
+                self.global_id_to_head_local[global_id] = (base, local_idx)
+                local_global_ids.append(global_id)
+
+            self.mod_head_defs[base] = head_labels
+            self.head_global_ids[base] = local_global_ids
+            aliases = self.base_slot_aliases.get(base, [base])
+            if base == "T" and "U" in aliases:
+                self.head_display_names[base] = "T/U slot"
+            else:
+                self.head_display_names[base] = base
+
+        for base in self.mod_bases:
+            canonical_id = self.global_label_to_id.get(self._canonical_label(base))
+            if canonical_id is None:
+                raise ValueError(f"Missing canonical global label for base {base}")
+            if canonical_id not in self.global_id_to_head_local:
+                raise ValueError(f"Canonical global label for base {base} is not assigned to head {base}")
+
+        self.mod_trunk_dim = int(model_cfg.get("mod_trunk_dim", 128))
+        self.mod_trunk_kernel_size = int(model_cfg.get("mod_trunk_kernel_size", 5))
+        self.mod_trunk_depth = int(model_cfg.get("mod_trunk_depth", 1))
+        self.mod_head_dropout = float(model_cfg.get("mod_head_dropout", 0.1))
+
+        self.mod_input_proj = torch.nn.Linear(d_model, self.mod_trunk_dim)
+        self.mod_trunk = torch.nn.ModuleList([
+            LightweightModBlock(self.mod_trunk_dim, self.mod_trunk_kernel_size, self.mod_head_dropout)
+            for _ in range(max(self.mod_trunk_depth, 0))
+        ])
+        self.mod_heads = torch.nn.ModuleDict({
+            base: torch.nn.Linear(self.mod_trunk_dim, len(self.mod_head_defs[base]))
+            for base in self.mod_bases
+        })
 
         self.stride = stride
         self.config = config
 
-    def _resolve_state_len(self, config, pretrained_encoder_cfg):
+    @staticmethod
+    def _resolve_state_len(config, pretrained_encoder_cfg):
         if pretrained_encoder_cfg and "crf" in pretrained_encoder_cfg:
             return pretrained_encoder_cfg["crf"].get("state_len", config.get("global_norm", {}).get("state_len", 5))
         return config.get("global_norm", {}).get("state_len", 5)
+
+    @staticmethod
+    def _canonical_label(base: str) -> str:
+        return f"canonical_{base}"
+
+    def _base_label(self, token_value: int) -> str | None:
+        if token_value <= 0 or token_value >= len(self.alphabet):
+            return None
+        return str(self.alphabet[int(token_value)]).upper()
+
+    def _base_slot_for_label(self, base_label: str | None) -> str | None:
+        if base_label is None:
+            return None
+        return self.base_label_to_slot.get(str(base_label).upper())
+
+    def _base_slot_for_token(self, token_value: int) -> str | None:
+        return self._base_slot_for_label(self._base_label(token_value))
 
     def _encode_features_and_base_scores(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
         if hasattr(self, "encoder"):
@@ -152,22 +293,64 @@ class MultiHeadModel(torch.nn.Module):
         return self.seqdist.viterbi(scores.log()).to(torch.int16).T
 
     def _per_base_prediction_tensors(self, outputs) -> List[Dict[str, object]]:
-        mod_logits = outputs["mod_logits"].to(torch.float32)
         with torch.no_grad():
             paths = self._decode_paths(outputs["base_scores"])
 
         predictions = []
-        for sample_idx, path in enumerate(paths):
+        for path in paths:
             emit_positions = torch.nonzero(path != 0, as_tuple=False).flatten()
             emit_tokens = path.index_select(0, emit_positions).to(torch.long)
-            sample_logits = mod_logits[sample_idx].index_select(0, emit_positions)
             predictions.append({
                 "emit_positions": emit_positions,
                 "emit_tokens": emit_tokens,
-                "mod_logits": sample_logits,
                 "sequence": self._tokens_to_string(emit_tokens),
             })
         return predictions
+
+    def _head_probabilities(self, head_name: str, logits: torch.Tensor) -> torch.Tensor:
+        if logits.shape[-1] == 1:
+            return torch.ones_like(logits, dtype=torch.float32)
+        return torch.softmax(logits, dim=-1)
+
+    def _head_predictions(self, head_name: str, logits: torch.Tensor, mod_threshold: float = 0.5) -> torch.Tensor:
+        num_classes = logits.shape[-1]
+        if num_classes == 1:
+            return logits.new_zeros((logits.shape[0],), dtype=torch.int64)
+
+        probs = torch.softmax(logits, dim=-1)
+        if num_classes == 2:
+            modified_probs = probs[:, 1]
+            return torch.where(
+                modified_probs >= mod_threshold,
+                torch.ones_like(modified_probs, dtype=torch.int64),
+                torch.zeros_like(modified_probs, dtype=torch.int64),
+            )
+        return probs.argmax(dim=-1)
+
+    def _prediction_scores(self, probs: torch.Tensor, local_preds: torch.Tensor) -> torch.Tensor:
+        if probs.ndim == 1:
+            return probs
+        if probs.shape[-1] == 1:
+            return probs.squeeze(-1)
+        return probs.gather(1, local_preds.unsqueeze(-1)).squeeze(-1)
+
+    def _local_to_global_id(self, head_name: str, local_idx: int) -> int:
+        return self.head_global_ids[head_name][int(local_idx)]
+
+    def _global_to_local(self, global_id: int) -> Tuple[str, int] | None:
+        return self.global_id_to_head_local.get(int(global_id))
+
+    def _empty_head_projection(self, outputs) -> Dict[str, Dict[str, torch.Tensor]]:
+        device = outputs["base_scores"].device
+        projections = {}
+        for head_name in self.mod_bases:
+            num_classes = len(self.mod_head_defs[head_name])
+            projections[head_name] = {
+                "flat_logits": torch.zeros((0, num_classes), device=device, dtype=torch.float32),
+                "flat_targets": torch.zeros((0,), device=device, dtype=torch.long),
+                "flat_global_targets": torch.zeros((0,), device=device, dtype=torch.long),
+            }
+        return projections
 
     def _equal_alignment_pairs(self, query_seq: str, target_seq: str) -> List[Tuple[int, int]]:
         if not query_seq or not target_seq:
@@ -198,23 +381,19 @@ class MultiHeadModel(torch.nn.Module):
                 raise ValueError(f"Unsupported CIGAR op from edlib: {op}")
         return pairs
 
-    def _mod_probabilities(self, logits: torch.Tensor) -> torch.Tensor:
-        if self.num_mod_classes == 1:
-            return torch.sigmoid(logits.squeeze(-1))
-        return torch.softmax(logits, dim=-1)
-
-    def _mod_predictions(self, logits: torch.Tensor, mod_threshold: float = 0.5) -> torch.Tensor:
-        if self.num_mod_classes == 1:
-            return (torch.sigmoid(logits.squeeze(-1)) >= mod_threshold).to(torch.int64)
-        return torch.softmax(logits, dim=-1).argmax(dim=-1)
-
     def forward(self, x) -> Dict[str, torch.Tensor]:
         features, base_scores = self._encode_features_and_base_scores(x)
-        mod_hidden = F.gelu(self.mod_adapter(features))
-        mod_logits = self.mod_decoder(mod_hidden)
+        mod_hidden = self.mod_input_proj(features)
+        for block in self.mod_trunk:
+            mod_hidden = block(mod_hidden)
+        mod_logits_by_base = {
+            base: head(mod_hidden)
+            for base, head in self.mod_heads.items()
+        }
         return {
             "base_scores": base_scores,
-            "mod_logits": mod_logits,
+            "mod_features": mod_hidden,
+            "mod_logits_by_base": mod_logits_by_base,
         }
 
     def decode_batch(self, outputs):
@@ -223,20 +402,42 @@ class MultiHeadModel(torch.nn.Module):
 
     def predict_mods(self, outputs, mod_threshold: float = 0.5) -> List[Dict[str, object]]:
         predictions = []
-        for sample in self._per_base_prediction_tensors(outputs):
-            logits = sample["mod_logits"].detach().to(torch.float32)
-            probs = self._mod_probabilities(logits)
-            preds = self._mod_predictions(logits, mod_threshold=mod_threshold)
+        mod_logits_by_base = outputs["mod_logits_by_base"]
+        for sample_idx, sample in enumerate(self._per_base_prediction_tensors(outputs)):
             emit_tokens = sample["emit_tokens"].detach().cpu().tolist()
             emit_positions = sample["emit_positions"].detach().cpu().tolist()
+            site_predictions = []
+
+            for record_idx, token_value in enumerate(emit_tokens):
+                base_label = self._base_label(int(token_value))
+                head_name = self._base_slot_for_label(base_label)
+                if head_name is None:
+                    continue
+
+                logits = mod_logits_by_base[head_name][sample_idx, emit_positions[record_idx]].detach().to(torch.float32).unsqueeze(0)
+                probs = self._head_probabilities(head_name, logits)
+                local_preds = self._head_predictions(head_name, logits, mod_threshold=mod_threshold)
+                local_pred = int(local_preds.item())
+                global_pred_id = self._local_to_global_id(head_name, local_pred)
+                score = float(self._prediction_scores(probs, local_preds).item())
+
+                site_predictions.append({
+                    "base_label": base_label,
+                    "head_name": self.head_display_names[head_name],
+                    "global_pred_id": global_pred_id,
+                    "global_pred_label": self.mod_global_labels[global_pred_id],
+                    "local_pred_id": local_pred,
+                    "local_probs": probs.squeeze(0).detach().cpu().tolist(),
+                    "score": score,
+                    "emit_position": int(emit_positions[record_idx]),
+                })
+
             predictions.append({
                 "sequence": sample["sequence"],
                 "emit_positions": emit_positions,
                 "emit_tokens": emit_tokens,
-                "base_labels": [self.alphabet[int(token)] for token in emit_tokens],
-                "mod_logits": logits.cpu().tolist(),
-                "mod_probs": probs.cpu().tolist(),
-                "mod_preds": preds.cpu().tolist(),
+                "base_labels": [self._base_label(int(token)) for token in emit_tokens],
+                "sites": site_predictions,
             })
         return predictions
 
@@ -251,9 +452,9 @@ class MultiHeadModel(torch.nn.Module):
         site_record_limit: int | None = None,
     ) -> Dict[str, object]:
         predictions = self._per_base_prediction_tensors(outputs)
-
-        flat_logits_chunks: List[torch.Tensor] = []
-        flat_target_chunks: List[torch.Tensor] = []
+        per_head_logits = {base: [] for base in self.mod_bases}
+        per_head_targets = {base: [] for base in self.mod_bases}
+        per_head_global_targets = {base: [] for base in self.mod_bases}
         sample_records: List[Dict[str, object]] = []
         site_records: List[Dict[str, object]] = []
         remaining_site_slots = None if site_record_limit is None else max(int(site_record_limit), 0)
@@ -270,59 +471,103 @@ class MultiHeadModel(torch.nn.Module):
             aligned_valid_mod_sites = 0
 
             if mod_targets is not None:
-                valid_target_mod_sites = int((mod_targets[sample_idx, :target_len] != -100).sum().item())
+                valid_target_mod_sites = int((mod_targets[sample_idx, :target_len] != IGNORE_INDEX).sum().item())
 
             if equal_pairs:
-                pred_indices = torch.tensor([query_idx for query_idx, _ in equal_pairs], device=sample["mod_logits"].device, dtype=torch.long)
+                sample_device = outputs["base_scores"].device
+                pred_indices = torch.tensor([query_idx for query_idx, _ in equal_pairs], device=sample_device, dtype=torch.long)
                 target_indices = torch.tensor([target_idx for _, target_idx in equal_pairs], device=targets.device, dtype=torch.long)
-                matched_logits = sample["mod_logits"].index_select(0, pred_indices).to(torch.float32)
 
                 if mod_targets is not None:
                     matched_mod_targets = mod_targets[sample_idx, :target_len].index_select(0, target_indices)
-                    valid_mask = matched_mod_targets != -100
+                    matched_target_tokens = target_tokens.index_select(0, target_indices)
+                    valid_mask = matched_mod_targets != IGNORE_INDEX
                     aligned_valid_mod_sites = int(valid_mask.sum().item())
                     if aligned_valid_mod_sites > 0:
-                        valid_logits = matched_logits[valid_mask]
-                        valid_targets = matched_mod_targets[valid_mask]
-                        flat_logits_chunks.append(valid_logits)
-                        flat_target_chunks.append(valid_targets)
+                        valid_pred_indices = pred_indices[valid_mask]
+                        valid_target_indices = target_indices[valid_mask]
+                        valid_targets = matched_mod_targets[valid_mask].to(torch.long)
+                        valid_target_tokens = matched_target_tokens[valid_mask]
 
-                        if include_site_records and (remaining_site_slots is None or remaining_site_slots > 0):
-                            if self.num_mod_classes == 1:
-                                site_scores = torch.sigmoid(valid_logits.squeeze(-1))
-                                site_preds = (site_scores >= mod_threshold).to(torch.int64)
-                            else:
-                                site_probs = torch.softmax(valid_logits, dim=-1)
-                                site_scores = site_probs.max(dim=-1).values
-                                site_preds = site_probs.argmax(dim=-1)
+                        for head_name in self.mod_bases:
+                            slot_mask_values = [
+                                self._base_slot_for_token(int(token_value.item())) == head_name
+                                for token_value in valid_target_tokens
+                            ]
+                            if not any(slot_mask_values):
+                                continue
 
-                            valid_pred_indices = pred_indices[valid_mask].detach().cpu().tolist()
-                            valid_target_indices = target_indices[valid_mask].detach().cpu().tolist()
-                            emit_positions = sample["emit_positions"].detach().cpu().tolist()
-                            emit_tokens = sample["emit_tokens"].detach().cpu().tolist()
-                            target_token_values = target_tokens.detach().cpu().tolist()
-                            target_mod_values = valid_targets.detach().cpu().tolist()
-                            score_values = site_scores.detach().cpu().tolist()
-                            pred_values = site_preds.detach().cpu().tolist()
+                            slot_mask = torch.tensor(slot_mask_values, device=valid_targets.device, dtype=torch.bool)
+                            slot_pred_indices = valid_pred_indices[slot_mask]
+                            slot_target_indices = valid_target_indices[slot_mask]
+                            slot_global_targets = valid_targets[slot_mask]
+                            slot_time_indices = sample["emit_positions"].to(slot_pred_indices.device).index_select(0, slot_pred_indices)
+                            slot_logits_all = outputs["mod_logits_by_base"][head_name][sample_idx].to(torch.float32)
 
-                            for record_index, (pred_index, target_index) in enumerate(zip(valid_pred_indices, valid_target_indices)):
-                                if remaining_site_slots == 0:
-                                    break
-                                site_records.append({
-                                    "sample_index_in_batch": sample_idx,
-                                    "predicted_base_index": int(pred_index),
-                                    "time_step": int(emit_positions[pred_index]),
-                                    "target_pos": int(target_index),
-                                    "pred_base": self.alphabet[int(emit_tokens[pred_index])],
-                                    "ref_base": self.alphabet[int(target_token_values[target_index])],
-                                    "true_mod": int(target_mod_values[record_index]),
-                                    "pred_mod": int(pred_values[record_index]),
-                                    "score": float(score_values[record_index]),
-                                })
-                                if remaining_site_slots is not None:
-                                    remaining_site_slots -= 1
+                            local_target_values = []
+                            keep_mask_values = []
+                            for global_target in slot_global_targets.detach().cpu().tolist():
+                                head_mapping = self._global_to_local(global_target)
+                                if head_mapping is None or head_mapping[0] != head_name:
+                                    keep_mask_values.append(False)
+                                    continue
+                                keep_mask_values.append(True)
+                                local_target_values.append(head_mapping[1])
+
+                            if not any(keep_mask_values):
+                                continue
+
+                            keep_mask = torch.tensor(keep_mask_values, device=slot_global_targets.device, dtype=torch.bool)
+                            selected_pred_indices = slot_pred_indices[keep_mask]
+                            selected_target_indices = slot_target_indices[keep_mask]
+                            selected_time_indices = slot_time_indices[keep_mask]
+                            selected_logits = slot_logits_all.index_select(0, selected_time_indices)
+                            selected_global_targets = slot_global_targets[keep_mask]
+                            selected_local_targets = torch.tensor(
+                                local_target_values,
+                                device=slot_global_targets.device,
+                                dtype=torch.long,
+                            )
+
+                            per_head_logits[head_name].append(selected_logits)
+                            per_head_targets[head_name].append(selected_local_targets)
+                            per_head_global_targets[head_name].append(selected_global_targets)
+
+                            if include_site_records and (remaining_site_slots is None or remaining_site_slots > 0):
+                                probs = self._head_probabilities(head_name, selected_logits)
+                                local_preds = self._head_predictions(head_name, selected_logits, mod_threshold=mod_threshold)
+                                scores = self._prediction_scores(probs, local_preds)
+                                emit_positions = sample["emit_positions"].detach().cpu().tolist()
+                                emit_tokens = sample["emit_tokens"].detach().cpu().tolist()
+                                target_token_values = target_tokens.detach().cpu().tolist()
+                                selected_pred_indices_list = selected_pred_indices.detach().cpu().tolist()
+                                selected_target_indices_list = selected_target_indices.detach().cpu().tolist()
+                                true_global_targets = selected_global_targets.detach().cpu().tolist()
+                                pred_local_values = local_preds.detach().cpu().tolist()
+                                score_values = scores.detach().cpu().tolist()
+
+                                for record_idx, (pred_index, target_index) in enumerate(zip(selected_pred_indices_list, selected_target_indices_list)):
                                     if remaining_site_slots == 0:
                                         break
+                                    pred_global_id = self._local_to_global_id(head_name, pred_local_values[record_idx])
+                                    site_records.append({
+                                        "sample_index_in_batch": sample_idx,
+                                        "predicted_base_index": int(pred_index),
+                                        "time_step": int(emit_positions[pred_index]),
+                                        "target_pos": int(target_index),
+                                        "pred_base": self._base_label(int(emit_tokens[pred_index])),
+                                        "ref_base": self._base_label(int(target_token_values[target_index])),
+                                        "head_name": self.head_display_names[head_name],
+                                        "true_mod": int(true_global_targets[record_idx]),
+                                        "true_mod_label": self.mod_global_labels[int(true_global_targets[record_idx])],
+                                        "pred_mod": int(pred_global_id),
+                                        "pred_mod_label": self.mod_global_labels[int(pred_global_id)],
+                                        "score": float(score_values[record_idx]),
+                                    })
+                                    if remaining_site_slots is not None:
+                                        remaining_site_slots -= 1
+                                        if remaining_site_slots == 0:
+                                            break
 
             sample_records.append({
                 "sample_index_in_batch": sample_idx,
@@ -338,21 +583,15 @@ class MultiHeadModel(torch.nn.Module):
                 "target_sequence_prefix": target_seq[:80],
             })
 
-        feature_dim = self.num_mod_classes if self.num_mod_classes > 1 else 1
-        if flat_logits_chunks:
-            flat_logits = torch.cat(flat_logits_chunks, dim=0)
-        else:
-            flat_logits = outputs["mod_logits"].new_zeros((0, feature_dim), dtype=torch.float32)
-
-        target_dtype = mod_targets.dtype if mod_targets is not None else targets.dtype
-        if flat_target_chunks:
-            flat_targets = torch.cat(flat_target_chunks, dim=0)
-        else:
-            flat_targets = targets.new_zeros((0,), dtype=target_dtype)
+        head_projections = self._empty_head_projection(outputs)
+        for head_name in self.mod_bases:
+            if per_head_logits[head_name]:
+                head_projections[head_name]["flat_logits"] = torch.cat(per_head_logits[head_name], dim=0)
+                head_projections[head_name]["flat_targets"] = torch.cat(per_head_targets[head_name], dim=0)
+                head_projections[head_name]["flat_global_targets"] = torch.cat(per_head_global_targets[head_name], dim=0)
 
         return {
-            "flat_logits": flat_logits,
-            "flat_targets": flat_targets,
+            "per_head": head_projections,
             "sample_records": sample_records,
             "site_records": site_records,
         }
@@ -362,15 +601,23 @@ class MultiHeadModel(torch.nn.Module):
         base_loss = self.seqdist.ctc_loss(base_scores.to(torch.float32), targets, target_lengths)
 
         projection = self.align_predictions_to_targets(outputs, targets, target_lengths, mod_targets)
-        flat_logits = projection["flat_logits"]
-        flat_targets = projection["flat_targets"]
+        weighted_mod_loss = base_scores.new_zeros((), dtype=torch.float32)
+        contributing_sites = 0
 
-        if flat_targets.numel() == 0:
+        for head_name, head_projection in projection["per_head"].items():
+            flat_logits = head_projection["flat_logits"]
+            flat_targets = head_projection["flat_targets"]
+            if flat_targets.numel() == 0 or flat_logits.shape[-1] <= 1:
+                continue
+            head_loss = F.cross_entropy(flat_logits, flat_targets.long())
+            site_count = int(flat_targets.numel())
+            weighted_mod_loss = weighted_mod_loss + (head_loss * site_count)
+            contributing_sites += site_count
+
+        if contributing_sites == 0:
             mod_loss = base_scores.new_zeros(())
-        elif self.num_mod_classes == 1:
-            mod_loss = F.binary_cross_entropy_with_logits(flat_logits.squeeze(-1), flat_targets.float())
         else:
-            mod_loss = F.cross_entropy(flat_logits, flat_targets.long())
+            mod_loss = weighted_mod_loss / contributing_sites
 
         total_loss = base_loss + (self.mod_loss_weight * mod_loss)
         return {

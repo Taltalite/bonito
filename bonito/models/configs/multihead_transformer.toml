@@ -6,11 +6,25 @@ dim_feedforward = 1024
 num_layers = 4
 kernel_size = 5
 stride = 2
-num_mod_classes = 1
 mod_task = "multilabel"
 mod_loss_weight = 1.0
 mod_target_projection = "viterbi_edlib_equal"
 mod_decode_projection = "viterbi_path"
+mod_bases = ["A", "C", "G", "T"]
+mod_global_labels = ["canonical_A", "canonical_C", "canonical_G", "canonical_T", "m6A"]
+mod_trunk_dim = 128
+mod_trunk_kernel_size = 5
+mod_trunk_depth = 1
+mod_head_dropout = 0.1
+
+[model.mod_head_defs]
+A = ["canonical_A", "m6A"]
+C = ["canonical_C"]
+G = ["canonical_G"]
+T = ["canonical_T"]
+
+[model.base_slot_aliases]
+T = ["T", "U"]
 
 [input]
 features = 1
