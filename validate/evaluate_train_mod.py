@@ -192,6 +192,189 @@ def compute_multiclass_mod_metrics(y_true: np.ndarray, y_pred: np.ndarray, confi
     }
 
 
+def get_global_mod_labels(model) -> List[str]:
+    labels = list(getattr(model, "mod_global_labels", []) or [])
+    if labels:
+        return labels
+    num_classes = int(getattr(model, "num_mod_classes", 1))
+    if num_classes <= 1:
+        return ["canonical", "modified"]
+    return [f"class_{idx}" for idx in range(num_classes)]
+
+
+def get_head_display_name(model, head_name: str) -> str:
+    return str(getattr(model, "head_display_names", {}).get(head_name, head_name))
+
+
+def compute_head_predictions(logits: torch.Tensor, threshold: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    logits = logits.detach().to(torch.float32)
+    num_classes = int(logits.shape[-1])
+
+    if num_classes == 1:
+        probs = torch.ones_like(logits, dtype=torch.float32)
+        preds = torch.zeros((logits.shape[0],), device=logits.device, dtype=torch.int64)
+        conf = torch.ones((logits.shape[0],), device=logits.device, dtype=torch.float32)
+        return (
+            preds.cpu().numpy().astype(np.int64),
+            conf.cpu().numpy().astype(np.float32),
+            probs.cpu().numpy().astype(np.float32),
+        )
+
+    probs = torch.softmax(logits, dim=-1)
+    if num_classes == 2:
+        modified_prob = probs[:, 1]
+        preds = torch.where(
+            modified_prob >= threshold,
+            torch.ones_like(modified_prob, dtype=torch.int64),
+            torch.zeros_like(modified_prob, dtype=torch.int64),
+        )
+    else:
+        preds = probs.argmax(dim=-1)
+    conf = probs.gather(1, preds.unsqueeze(-1)).squeeze(-1)
+    return (
+        preds.cpu().numpy().astype(np.int64),
+        conf.cpu().numpy().astype(np.float32),
+        probs.cpu().numpy().astype(np.float32),
+    )
+
+
+def aggregate_modification_metrics(model, projection: Dict[str, object], threshold: float) -> Dict[str, object]:
+    global_labels = get_global_mod_labels(model)
+    canonical_global_ids = {
+        int(getattr(model, "global_label_to_id", {}).get(f"canonical_{base}"))
+        for base in getattr(model, "mod_bases", [])
+        if f"canonical_{base}" in getattr(model, "global_label_to_id", {})
+    }
+
+    global_true_parts: List[np.ndarray] = []
+    global_pred_parts: List[np.ndarray] = []
+    global_conf_parts: List[np.ndarray] = []
+    binary_true_parts: List[np.ndarray] = []
+    binary_prob_parts: List[np.ndarray] = []
+    per_head_summary: Dict[str, object] = {}
+
+    for head_name, head_projection in projection.get("per_head", {}).items():
+        flat_logits = head_projection["flat_logits"].detach().to(torch.float32)
+        flat_targets = head_projection["flat_targets"].detach().cpu().numpy().astype(np.int64)
+        flat_global_targets = head_projection["flat_global_targets"].detach().cpu().numpy().astype(np.int64)
+        class_labels = list(getattr(model, "mod_head_defs", {}).get(head_name, []))
+        head_display_name = get_head_display_name(model, head_name)
+        num_classes = int(flat_logits.shape[-1]) if flat_logits.ndim == 2 else 0
+
+        if flat_global_targets.size == 0:
+            per_head_summary[head_name] = {
+                "display_name": head_display_name,
+                "task_type": "empty",
+                "num_sites": 0,
+                "class_labels": class_labels,
+                "global_label_ids": list(getattr(model, "head_global_ids", {}).get(head_name, [])),
+            }
+            continue
+
+        local_pred, local_conf, local_probs = compute_head_predictions(flat_logits, threshold)
+        head_global_ids = list(getattr(model, "head_global_ids", {}).get(head_name, []))
+        global_pred = np.asarray([head_global_ids[idx] for idx in local_pred], dtype=np.int64)
+
+        global_true_parts.append(flat_global_targets)
+        global_pred_parts.append(global_pred)
+        global_conf_parts.append(local_conf)
+
+        is_modified_true = (~np.isin(flat_global_targets, list(canonical_global_ids))).astype(np.int64)
+        if local_probs.shape[1] <= 1:
+            modified_prob = np.zeros(flat_global_targets.shape[0], dtype=np.float32)
+        else:
+            modified_prob = 1.0 - local_probs[:, 0]
+        binary_true_parts.append(is_modified_true)
+        binary_prob_parts.append(modified_prob.astype(np.float32))
+
+        if num_classes <= 1:
+            per_head_metrics = {
+                "task_type": "single_class",
+                "num_sites": int(flat_targets.size),
+                "accuracy": 1.0,
+                "macro_f1": 1.0,
+                "mean_confidence": 1.0,
+                "class_labels": class_labels,
+            }
+        elif num_classes == 2:
+            per_head_metrics = {
+                "task_type": "binary",
+                "threshold": threshold,
+                "class_labels": class_labels,
+                **compute_binary_mod_metrics(flat_targets, local_probs[:, 1], threshold),
+            }
+        else:
+            per_head_metrics = {
+                "task_type": "multiclass",
+                "class_labels": class_labels,
+                **compute_multiclass_mod_metrics(flat_targets, local_pred, local_conf, num_classes),
+            }
+
+        per_head_summary[head_name] = {
+            "display_name": head_display_name,
+            "global_label_ids": head_global_ids,
+            **per_head_metrics,
+        }
+
+    if global_true_parts:
+        global_true = np.concatenate(global_true_parts)
+        global_pred = np.concatenate(global_pred_parts)
+        global_conf = np.concatenate(global_conf_parts)
+        overall = {
+            "task_type": "global_multiclass",
+            "global_labels": global_labels,
+            **compute_multiclass_mod_metrics(global_true, global_pred, global_conf, len(global_labels)),
+        }
+    else:
+        overall = {
+            "task_type": "global_multiclass",
+            "global_labels": global_labels,
+            "num_sites": 0,
+            "accuracy": 0.0,
+            "macro_f1": 0.0,
+            "mean_confidence": 0.0,
+            "confusion_matrix": [],
+            "per_class": [],
+        }
+
+    if binary_true_parts:
+        binary_true = np.concatenate(binary_true_parts)
+        binary_prob = np.concatenate(binary_prob_parts)
+        modified_vs_canonical = {
+            "task_type": "binary_modified_vs_canonical",
+            "threshold": threshold,
+            **compute_binary_mod_metrics(binary_true, binary_prob, threshold),
+        }
+    else:
+        modified_vs_canonical = {
+            "task_type": "binary_modified_vs_canonical",
+            "threshold": threshold,
+            "num_sites": 0,
+            "num_positive": 0,
+            "num_negative": 0,
+            "positive_rate": 0.0,
+            "predicted_positive_rate": 0.0,
+            "accuracy": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "tp": 0,
+            "tn": 0,
+            "fp": 0,
+            "fn": 0,
+            "mean_positive_prob": None,
+            "mean_negative_prob": None,
+            "roc_auc": None,
+            "pr_auc": None,
+        }
+
+    return {
+        "overall": overall,
+        "modified_vs_canonical": modified_vs_canonical,
+        "per_head": per_head_summary,
+    }
+
+
 def maybe_trim_refs(refs: List[str], model) -> List[str]:
     n_pre = getattr(model, "n_pre_context_bases", 0)
     n_post = getattr(model, "n_post_context_bases", 0)
@@ -313,7 +496,7 @@ def save_binary_mod_plots(y_true: np.ndarray, y_prob: np.ndarray, threshold: flo
     return written
 
 
-def save_multiclass_mod_plot(confusion: np.ndarray, output_dir: Path) -> List[str]:
+def save_multiclass_mod_plot(confusion: np.ndarray, output_dir: Path, class_labels: Optional[List[str]] = None) -> List[str]:
     written = []
     if plt is None or confusion.size == 0:
         return written
@@ -326,6 +509,9 @@ def save_multiclass_mod_plot(confusion: np.ndarray, output_dir: Path) -> List[st
     ax.set_ylabel("True")
     ax.set_xticks(range(confusion.shape[1]))
     ax.set_yticks(range(confusion.shape[0]))
+    if class_labels and len(class_labels) == confusion.shape[0]:
+        ax.set_xticklabels(class_labels, rotation=45, ha="right")
+        ax.set_yticklabels(class_labels)
     for i in range(confusion.shape[0]):
         for j in range(confusion.shape[1]):
             ax.text(j, i, str(int(confusion[i, j])), ha="center", va="center", color="black")
@@ -440,7 +626,7 @@ def save_signal_alignment_examples(signal_examples: List[Dict[str, object]], out
 
         emit_positions = np.asarray(example["emit_positions"], dtype=np.int64)
         emit_signal_positions = np.clip(emit_positions * int(stride), 0, signal.size - 1)
-        mod_probs = np.asarray(example["mod_probs"], dtype=np.float32)
+        site_scores = np.asarray(example["site_scores"], dtype=np.float32)
         base_labels = list(example["base_labels"])
         site_records = list(example["site_records"])
 
@@ -455,7 +641,7 @@ def save_signal_alignment_examples(signal_examples: List[Dict[str, object]], out
         )
         ax_signal.set_xlabel("Signal sample index")
         ax_signal.set_ylabel("Current")
-        ax_mod.set_ylabel("Mod probability")
+        ax_mod.set_ylabel("Predicted site score")
         ax_mod.set_ylim(-0.10, 1.25)
 
         if emit_signal_positions.size:
@@ -463,11 +649,11 @@ def save_signal_alignment_examples(signal_examples: List[Dict[str, object]], out
             for raw_x in emit_signal_positions:
                 ax_signal.axvline(int(raw_x), color="#8fbcbb", alpha=line_alpha, linewidth=0.6, zorder=0)
 
-            ax_mod.plot(emit_signal_positions, mod_probs, color="#2ca02c", linewidth=1.2, alpha=0.9, label="pred mod prob")
+            ax_mod.plot(emit_signal_positions, site_scores, color="#2ca02c", linewidth=1.2, alpha=0.9, label="pred site score")
             scatter = ax_mod.scatter(
                 emit_signal_positions,
-                mod_probs,
-                c=mod_probs if mod_probs.size else np.zeros_like(emit_signal_positions, dtype=np.float32),
+                site_scores,
+                c=site_scores if site_scores.size else np.zeros_like(emit_signal_positions, dtype=np.float32),
                 cmap="coolwarm",
                 s=22,
                 alpha=0.95,
@@ -503,11 +689,11 @@ def save_signal_alignment_examples(signal_examples: List[Dict[str, object]], out
             ], dtype=np.int64)
             pred_indices = [int(record["predicted_base_index"]) for record in site_records]
             pred_scores = np.asarray([
-                float(mod_probs[idx]) if idx < len(mod_probs) else float(record.get("score", 0.0))
+                float(site_scores[idx]) if idx < len(site_scores) else float(record.get("score", 0.0))
                 for idx in pred_indices
             ], dtype=np.float32)
-            pred_colors = ["#d62728" if int(record["pred_mod"]) == 1 else "#1f77b4" for record in site_records]
-            true_colors = ["#d62728" if int(record["true_mod"]) == 1 else "#1f77b4" for record in site_records]
+            pred_colors = ["#d62728" if int(record["pred_mod"]) != int(record["true_mod"]) else "#2ca02c" for record in site_records]
+            true_colors = ["#5e81ac" if "canonical" in str(record.get("true_mod_label", "")).lower() else "#bf616a" for record in site_records]
 
             ax_mod.scatter(
                 aligned_x,
@@ -539,8 +725,8 @@ def save_signal_alignment_examples(signal_examples: List[Dict[str, object]], out
             for idx in range(0, annotate_limit, annotate_stride):
                 record = site_records[idx]
                 x_pos = int(aligned_x[idx])
-                ref_text = f"{record['ref_base']}:{int(record['true_mod'])}"
-                pred_text = f"p:{int(record['pred_mod'])}"
+                ref_text = f"{record['ref_base']}:{record.get('true_mod_label', int(record['true_mod']))}"
+                pred_text = f"p:{record.get('pred_mod_label', int(record['pred_mod']))}"
                 ax_mod.text(x_pos, 1.16, ref_text, fontsize=10, ha="center", va="bottom", rotation=90, color="#5e81ac")
                 ax_mod.text(x_pos, min(float(pred_scores[idx]) + 0.06, 1.02), pred_text, fontsize=10, ha="center", va="bottom", rotation=90, color="#bf616a")
 
@@ -560,6 +746,9 @@ def build_text_summary(summary: Dict[str, object]) -> str:
     base = summary["base"]
     alignment = summary["alignment"]
     mod = summary["modification"]
+    overall = mod["overall"]
+    binary = mod["modified_vs_canonical"]
+    per_head = mod["per_head"]
     lines = [
         f"model_directory: {summary['model_directory']}",
         f"dataset_directory: {summary['dataset_directory']}",
@@ -584,27 +773,43 @@ def build_text_summary(summary: Dict[str, object]) -> str:
         f"mean_target_len: {alignment['mean_target_len']:.2f}",
         "",
         "[modification]",
-        f"task_type: {mod['task_type']}",
-        f"num_sites: {mod['num_sites']}",
+        f"task_type: {overall['task_type']}",
+        f"num_sites: {overall['num_sites']}",
+        f"accuracy: {overall['accuracy']:.4f}",
+        f"macro_f1: {overall['macro_f1']:.4f}",
+        f"mean_confidence: {overall['mean_confidence']:.4f}",
+        "",
+        "[modified_vs_canonical]",
+        f"threshold: {binary['threshold']:.3f}",
+        f"num_sites: {binary['num_sites']}",
+        f"positive_rate: {binary['positive_rate']:.4f}",
+        f"predicted_positive_rate: {binary['predicted_positive_rate']:.4f}",
+        f"accuracy: {binary['accuracy']:.4f}",
+        f"precision: {binary['precision']:.4f}",
+        f"recall: {binary['recall']:.4f}",
+        f"f1: {binary['f1']:.4f}",
+        f"roc_auc: {binary['roc_auc']}",
+        f"pr_auc: {binary['pr_auc']}",
     ]
-    if mod["task_type"] == "binary":
-        lines.extend([
-            f"threshold: {mod['threshold']:.3f}",
-            f"positive_rate: {mod['positive_rate']:.4f}",
-            f"predicted_positive_rate: {mod['predicted_positive_rate']:.4f}",
-            f"accuracy: {mod['accuracy']:.4f}",
-            f"precision: {mod['precision']:.4f}",
-            f"recall: {mod['recall']:.4f}",
-            f"f1: {mod['f1']:.4f}",
-            f"roc_auc: {mod['roc_auc']}",
-            f"pr_auc: {mod['pr_auc']}",
-        ])
-    else:
-        lines.extend([
-            f"accuracy: {mod['accuracy']:.4f}",
-            f"macro_f1: {mod['macro_f1']:.4f}",
-            f"mean_confidence: {mod['mean_confidence']:.4f}",
-        ])
+    if per_head:
+        lines.extend(["", "[per_head]"])
+        for head_name, head_summary in per_head.items():
+            lines.append(
+                f"- {head_summary['display_name']} ({head_name}): task_type={head_summary['task_type']}, "
+                f"num_sites={head_summary['num_sites']}"
+            )
+            if head_summary["task_type"] == "binary":
+                lines.append(
+                    f"  accuracy={head_summary['accuracy']:.4f}, f1={head_summary['f1']:.4f}, "
+                    f"roc_auc={head_summary['roc_auc']}"
+                )
+            elif head_summary["task_type"] == "multiclass":
+                lines.append(
+                    f"  accuracy={head_summary['accuracy']:.4f}, macro_f1={head_summary['macro_f1']:.4f}, "
+                    f"mean_confidence={head_summary['mean_confidence']:.4f}"
+                )
+            elif head_summary["task_type"] == "single_class":
+                lines.append("  single-class head (canonical-only in this run)")
     warnings = summary.get("warnings", [])
     if warnings:
         lines.extend(["", "[warnings]"])
@@ -653,12 +858,7 @@ def main(args):
     mod_alignment_records: List[Dict[str, object]] = []
     predicted_base_examples: List[Dict[str, object]] = []
     signal_examples: List[Dict[str, object]] = []
-
-    binary_true: List[np.ndarray] = []
-    binary_prob: List[np.ndarray] = []
-    multiclass_true: List[np.ndarray] = []
-    multiclass_pred: List[np.ndarray] = []
-    multiclass_conf: List[np.ndarray] = []
+    projection_batches: List[Dict[str, object]] = []
 
     loss_sums = {"loss": 0.0, "mod_loss": 0.0, "total_loss": 0.0}
     num_batches = 0
@@ -718,18 +918,7 @@ def main(args):
                 include_site_records=remaining_site_slots > 0,
                 site_record_limit=remaining_site_slots,
             )
-
-            flat_logits = projection["flat_logits"].detach().to(torch.float32)
-            flat_targets = projection["flat_targets"].detach().cpu().numpy().astype(np.int64)
-            if flat_targets.size:
-                if getattr(model, "num_mod_classes", 1) == 1:
-                    binary_true.append(flat_targets)
-                    binary_prob.append(torch.sigmoid(flat_logits.squeeze(-1)).cpu().numpy().astype(np.float32))
-                else:
-                    probs = torch.softmax(flat_logits, dim=-1)
-                    multiclass_true.append(flat_targets)
-                    multiclass_pred.append(probs.argmax(dim=-1).cpu().numpy().astype(np.int64))
-                    multiclass_conf.append(probs.max(dim=-1).values.cpu().numpy().astype(np.float32))
+            projection_batches.append(projection)
 
             for local_idx, sample_record in enumerate(projection["sample_records"]):
                 mod_alignment_records.append({
@@ -744,13 +933,11 @@ def main(args):
                 })
 
             for local_idx, prediction in enumerate(per_base_predictions):
+                site_predictions = list(prediction.get("sites", []))
                 if len(predicted_base_examples) < args.max_examples:
-                    if getattr(model, "num_mod_classes", 1) == 1:
-                        score_preview = prediction["mod_probs"][:40]
-                        pred_preview = prediction["mod_preds"][:40]
-                    else:
-                        score_preview = [max(row) for row in prediction["mod_probs"][:40]]
-                        pred_preview = prediction["mod_preds"][:40]
+                    score_preview = [float(site["score"]) for site in site_predictions[:40]]
+                    pred_preview = [site["global_pred_label"] for site in site_predictions[:40]]
+                    head_preview = [site["head_name"] for site in site_predictions[:40]]
                     predicted_base_examples.append({
                         "chunk_index": global_chunk_index + local_idx,
                         "predicted_base_len": len(prediction["sequence"]),
@@ -758,6 +945,7 @@ def main(args):
                         "first_20_time_steps": json.dumps(prediction["emit_positions"][:20]),
                         "first_40_mod_scores": json.dumps(score_preview),
                         "first_40_mod_preds": json.dumps(pred_preview),
+                        "first_40_heads": json.dumps(head_preview),
                     })
 
                 if len(signal_examples) < args.signal_example_limit:
@@ -772,10 +960,7 @@ def main(args):
                             "signal": data_cpu[local_idx].reshape(-1).numpy().tolist(),
                             "emit_positions": list(prediction["emit_positions"]),
                             "base_labels": list(prediction["base_labels"]),
-                            "mod_probs": [
-                                float(x) if not isinstance(x, list) else float(max(x))
-                                for x in prediction["mod_probs"]
-                            ],
+                            "site_scores": [float(site["score"]) for site in site_predictions],
                             "site_records": sample_sites,
                             "predicted_base_len": len(prediction["sequence"]),
                             "target_len": int(projection["sample_records"][local_idx]["target_len"]),
@@ -827,32 +1012,45 @@ def main(args):
                 "This usually means base predictions and references are still too far apart for stable mod supervision."
             )
 
-    num_mod_classes = getattr(model, "num_mod_classes", 1)
-    if num_mod_classes == 1:
-        y_true = np.concatenate(binary_true) if binary_true else np.array([], dtype=np.int64)
-        y_prob = np.concatenate(binary_prob) if binary_prob else np.array([], dtype=np.float32)
-        mod_summary: Dict[str, object] = {
-            "task_type": "binary",
-            "threshold": args.mod_threshold,
-            **compute_binary_mod_metrics(y_true, y_prob, args.mod_threshold),
-        }
-        if mod_summary["num_sites"] == 0:
-            warnings.append("No aligned valid modification sites were available for evaluation.")
-        elif mod_summary["num_positive"] == 0 or mod_summary["num_negative"] == 0:
-            warnings.append(
-                "All aligned valid modification labels belong to one class. ROC-AUC/PR-AUC are undefined, and this dataset "
-                "cannot teach a real modified-vs-unmodified decision boundary on its own."
-            )
-    else:
-        y_true = np.concatenate(multiclass_true) if multiclass_true else np.array([], dtype=np.int64)
-        y_pred = np.concatenate(multiclass_pred) if multiclass_pred else np.array([], dtype=np.int64)
-        y_conf = np.concatenate(multiclass_conf) if multiclass_conf else np.array([], dtype=np.float32)
-        mod_summary = {
-            "task_type": "multiclass",
-            **compute_multiclass_mod_metrics(y_true, y_pred, y_conf, num_mod_classes),
-        }
-        if mod_summary["num_sites"] == 0:
-            warnings.append("No aligned valid modification sites were available for evaluation.")
+    merged_projection = {
+        "per_head": {},
+        "sample_records": [],
+        "site_records": [],
+    }
+    for projection in projection_batches:
+        merged_projection["sample_records"].extend(projection["sample_records"])
+        merged_projection["site_records"].extend(projection["site_records"])
+        for head_name, head_projection in projection["per_head"].items():
+            merged_projection["per_head"].setdefault(head_name, {
+                "flat_logits": [],
+                "flat_targets": [],
+                "flat_global_targets": [],
+            })
+            for key in ("flat_logits", "flat_targets", "flat_global_targets"):
+                merged_projection["per_head"][head_name][key].append(head_projection[key].detach().cpu())
+
+    for head_name, head_projection in merged_projection["per_head"].items():
+        flat_logits_parts = head_projection["flat_logits"]
+        flat_targets_parts = head_projection["flat_targets"]
+        flat_global_target_parts = head_projection["flat_global_targets"]
+        if flat_logits_parts:
+            head_projection["flat_logits"] = torch.cat(flat_logits_parts, dim=0)
+            head_projection["flat_targets"] = torch.cat(flat_targets_parts, dim=0)
+            head_projection["flat_global_targets"] = torch.cat(flat_global_target_parts, dim=0)
+        else:
+            num_classes = len(getattr(model, "mod_head_defs", {}).get(head_name, []))
+            head_projection["flat_logits"] = torch.zeros((0, num_classes), dtype=torch.float32)
+            head_projection["flat_targets"] = torch.zeros((0,), dtype=torch.long)
+            head_projection["flat_global_targets"] = torch.zeros((0,), dtype=torch.long)
+
+    mod_summary = aggregate_modification_metrics(model, merged_projection, args.mod_threshold)
+    if mod_summary["overall"]["num_sites"] == 0:
+        warnings.append("No aligned valid modification sites were available for evaluation.")
+    elif mod_summary["modified_vs_canonical"]["num_positive"] == 0 or mod_summary["modified_vs_canonical"]["num_negative"] == 0:
+        warnings.append(
+            "All aligned valid modification labels collapse to one side of the modified-vs-canonical split. "
+            "Binary discrimination metrics are therefore incomplete for this dataset."
+        )
 
     summary = {
         "model_directory": str(Path(args.model_directory).resolve()),
@@ -878,13 +1076,39 @@ def main(args):
     written_plots: List[str] = []
     written_plots.extend(save_base_plots(base_df, output_dir))
     written_plots.extend(save_alignment_projection_plots(alignment_df, base_df, output_dir))
-    if num_mod_classes == 1:
-        y_true = np.concatenate(binary_true) if binary_true else np.array([], dtype=np.int64)
-        y_prob = np.concatenate(binary_prob) if binary_prob else np.array([], dtype=np.float32)
-        written_plots.extend(save_binary_mod_plots(y_true, y_prob, args.mod_threshold, output_dir))
-    else:
-        confusion = np.array(summary["modification"]["confusion_matrix"], dtype=np.int64)
-        written_plots.extend(save_multiclass_mod_plot(confusion, output_dir))
+    binary_summary = summary["modification"]["modified_vs_canonical"]
+    overall_summary = summary["modification"]["overall"]
+    if binary_summary["num_sites"] > 0:
+        binary_true = []
+        binary_prob = []
+        canonical_global_ids = {
+            int(getattr(model, "global_label_to_id", {}).get(f"canonical_{base}"))
+            for base in getattr(model, "mod_bases", [])
+            if f"canonical_{base}" in getattr(model, "global_label_to_id", {})
+        }
+        for head_name, head_projection in merged_projection["per_head"].items():
+            flat_logits = head_projection["flat_logits"]
+            flat_global_targets = head_projection["flat_global_targets"].cpu().numpy().astype(np.int64)
+            if flat_global_targets.size == 0:
+                continue
+            _, _, local_probs = compute_head_predictions(flat_logits, args.mod_threshold)
+            is_modified_true = (~np.isin(flat_global_targets, list(canonical_global_ids))).astype(np.int64)
+            if local_probs.shape[1] <= 1:
+                modified_prob = np.zeros(flat_global_targets.shape[0], dtype=np.float32)
+            else:
+                modified_prob = 1.0 - local_probs[:, 0]
+            binary_true.append(is_modified_true)
+            binary_prob.append(modified_prob.astype(np.float32))
+        written_plots.extend(
+            save_binary_mod_plots(
+                np.concatenate(binary_true) if binary_true else np.array([], dtype=np.int64),
+                np.concatenate(binary_prob) if binary_prob else np.array([], dtype=np.float32),
+                args.mod_threshold,
+                output_dir,
+            )
+        )
+    confusion = np.array(overall_summary["confusion_matrix"], dtype=np.int64)
+    written_plots.extend(save_multiclass_mod_plot(confusion, output_dir, class_labels=overall_summary.get("global_labels")))
     written_plots.extend(save_training_curves(Path(args.model_directory), output_dir))
     written_plots.extend(save_signal_alignment_examples(signal_examples, output_dir, stride=getattr(model, "stride", 1)))
 

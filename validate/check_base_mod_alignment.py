@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Inspect whether base and mod outputs are aligned in the current multihead model.
+Inspect whether base and mod outputs are aligned in the current multi-head model.
 
 This script reports three different notions of alignment:
-1. Shared encoder time axis: base_scores[T, B, C] vs mod_logits[B, T, K]
+1. Shared encoder time axis: base_scores[T, B, C] vs each mod head logits[B, T, K]
 2. Predicted-base axis derived from the CRF Viterbi path: emitted base count vs decoded sequence length
 3. Target-base projection coverage after mapping predicted bases back onto the target axis
 
@@ -153,13 +153,16 @@ def main(args):
                 outputs = model(data_device, *extra_device)
 
             base_scores = outputs["base_scores"].detach()
-            mod_logits = outputs["mod_logits"].detach()
+            mod_logits_by_base = outputs["mod_logits_by_base"]
             per_base_predictions = model.predict_mods(outputs)
             projection = model.align_predictions_to_targets(outputs, targets.to(args.device), lengths.to(args.device), mod_targets.to(args.device))
 
             time_steps_base = int(base_scores.shape[0])
-            time_steps_mod = int(mod_logits.shape[1])
-            time_axis_match = time_steps_base == time_steps_mod
+            head_time_steps = {
+                head_name: int(head_logits.shape[1])
+                for head_name, head_logits in mod_logits_by_base.items()
+            }
+            time_axis_match = all(head_steps == time_steps_base for head_steps in head_time_steps.values())
             if not time_axis_match:
                 total_time_mismatch += int(data.shape[0])
 
@@ -188,12 +191,13 @@ def main(args):
                 batch_valid_mod_coverage += float(projection_record["valid_mod_coverage"])
 
                 if len(sample_rows) < args.max_examples:
+                    site_preview = prediction["sites"][:40]
                     sample_rows.append({
                         "batch_index": batch_index,
                         "sample_index_in_batch": sample_offset,
                         "global_sample_index": total_samples + sample_offset,
                         "time_steps_base": time_steps_base,
-                        "time_steps_mod": time_steps_mod,
+                        "head_time_steps": json.dumps(head_time_steps, sort_keys=True),
                         "time_axis_match": time_axis_match,
                         "target_len": target_len,
                         "decoded_len": predicted_base_len,
@@ -208,7 +212,8 @@ def main(args):
                         "valid_mod_coverage": projection_record["valid_mod_coverage"],
                         "first_20_time_steps": prediction["emit_positions"][:20],
                         "first_40_pred_bases": prediction["sequence"][:40],
-                        "first_40_pred_mods": prediction["mod_preds"][:40],
+                        "first_40_pred_mod_labels": [item["global_pred_label"] for item in site_preview],
+                        "first_40_pred_mod_scores": [float(item["score"]) for item in site_preview],
                         "target_sequence_prefix": projection_record["target_sequence_prefix"][:40],
                     })
 
@@ -216,7 +221,7 @@ def main(args):
                 "batch_index": batch_index,
                 "batch_size": int(data.shape[0]),
                 "time_steps_base": time_steps_base,
-                "time_steps_mod": time_steps_mod,
+                "head_time_steps": json.dumps(head_time_steps, sort_keys=True),
                 "time_axis_match": time_axis_match,
                 "mean_target_len": batch_target_len / max(int(data.shape[0]), 1),
                 "mean_decoded_len": batch_decoded_len / max(int(data.shape[0]), 1),
@@ -231,13 +236,13 @@ def main(args):
     sample_df = pd.DataFrame(sample_rows)
 
     if not batch_df["time_axis_match"].all():
-        warnings.append("base_scores time axis and mod_logits time axis do not always match. This should not happen in the current architecture.")
+        warnings.append("base_scores time axis and one or more mod head time axes do not always match. This should not happen in the current architecture.")
     if total_decode_mismatch > 0:
         warnings.append("For some samples, the number of emitted Viterbi steps did not equal the predicted sequence length.")
     if total_samples_without_valid_projection > 0:
         warnings.append("Some samples had no valid target-axis modification supervision after Viterbi projection.")
     warnings.append(
-        "This checker now validates the actual per-base path: shared encoder time axis, predicted-base emission axis, and target-axis coverage after Viterbi projection."
+        "This checker validates the current per-base path: shared encoder time axis across all mod heads, predicted-base emission axis, and target-axis coverage after Viterbi projection."
     )
 
     summary = {
@@ -249,6 +254,7 @@ def main(args):
         "shared_time_axis": {
             "all_match": bool(batch_df["time_axis_match"].all()) if not batch_df.empty else False,
             "num_mismatched_samples": int(total_time_mismatch),
+            "head_time_steps_example": head_time_steps if batch_rows else {},
         },
         "predicted_base_axis": {
             "num_samples_with_decode_mismatch": int(total_decode_mismatch),
@@ -281,7 +287,6 @@ def main(args):
     print(f"artifacts written to: {output_dir}")
     if plot_files:
         print("plots:", ", ".join(plot_files))
-
 
 
 def argparser():
