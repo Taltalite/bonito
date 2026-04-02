@@ -372,4 +372,6 @@ bonito train_mod -f /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_m
   --lr 5e-5 \
   --chunks 300000 \
   --valid-chunks 20000 \
-  --device cuda:0
+  --device cuda:0 \
+  > /home/lijy/workspace/bonito/log/rna004_m6a_mix_15+15_ft.log 2>&1
+
