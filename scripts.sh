@@ -375,3 +375,35 @@ bonito train_mod -f /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_m
   --device cuda:0 \
   > /home/lijy/workspace/bonito/log/rna004_m6a_mix_15+15_ft.log 2>&1
 
+
+python validate/evaluate_train_mod.py \
+  --model_directory /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_15+15_ft \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_15wmod+15wcan \
+  --dataset valid \
+  --weights 20 \
+  --chunks 300000 \
+  --valid-chunks 20000 \
+  --batchsize 32 \
+  --device cuda:0 \
+  --output-dir /home/lijy/workspace/bonito/validate/res/rna004_m6a_mix_15+15_ft/validate_epoch20
+
+python validate/evaluate_train_mod.py \
+  --model_directory /home/lijy/workspace/bonito/bonito/models/rna004_130bps_sup@v5.2.0 \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_15wmod+15wcan \
+  --dataset valid \
+  --chunks 300000 \
+  --valid-chunks 20000 \
+  --batchsize 32 \
+  --device cuda:0 \
+  --output-dir /home/lijy/workspace/bonito/validate/res/rna004_sup_520/validate
+
+python validate/kmer_balanced_mod_report.py \
+  --mod-sites-tsv /home/lijy/workspace/bonito/validate/res/rna004_m6a_mix_15+15_ft/validate_epoch20/mod_site_examples.tsv \
+  --references-npy /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_15wmod+15wcan/references.npy \
+  --reference-lengths-npy /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_15wmod+15wcan/reference_lengths.npy \
+  --output-dir /home/lijy/workspace/bonito/validate/res/rna004_m6a_mix_15+15_ft/kmer_balanced_report \
+  --head-name A \
+  --kmer-size 5 \
+  --max-per-class-per-kmer 500 \
+  --positive-label-regex "(?i)m6a|modified" \
+  --canonical-label-regex "(?i)canonical"
