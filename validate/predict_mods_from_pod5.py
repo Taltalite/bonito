@@ -28,7 +28,7 @@ from typing import Dict, Iterable, Iterator, List, Tuple
 import torch
 from tqdm import tqdm
 
-from bonito.crf.basecall import compute_scores, stitch_results, to_str
+from bonito.crf.basecall import beam_search, stitch_results, to_str
 from bonito.multiprocessing import process_cancel, thread_iter
 from bonito.reader import Reader
 from bonito.util import batchify, chunk, column_to_set, init, load_model, unbatchify
@@ -237,16 +237,28 @@ def decode_basecall_beam_search(
     beam_cut: float,
     blank_score: float,
 ) -> Dict[str, object]:
-    attrs = compute_scores(
-        model,
-        chunk(torch.from_numpy(read.signal), chunksize, overlap),
-        beam_width=beam_width,
-        beam_cut=beam_cut,
-        scale=1.0,
-        offset=0.0,
-        blank_score=blank_score,
-        reverse=False,
-    )
+    device = next(model.parameters()).device
+    model_dtype = next(model.parameters()).dtype
+    batch = chunk(torch.from_numpy(read.signal), chunksize, overlap)
+    with torch.inference_mode():
+        outputs = model(batch.to(device=device, dtype=model_dtype, non_blocking=True))
+        scores = outputs["base_scores"]
+        if not str(scores.device).startswith("cuda"):
+            raise RuntimeError("Beam-search basecalling currently requires a CUDA device in this script.")
+        with torch.cuda.device(scores.device):
+            sequence, qstring, moves = beam_search(
+                scores,
+                beam_width=beam_width,
+                beam_cut=beam_cut,
+                scale=1.0,
+                offset=0.0,
+                blank_score=blank_score,
+            )
+    attrs = {
+        "sequence": sequence,
+        "qstring": qstring,
+        "moves": moves,
+    }
     stitched = stitch_results(attrs, len(read.signal), chunksize, overlap, model.stride, reverse=False)
 
     raw_sequence_signal_order = to_str(stitched["sequence"])
