@@ -28,7 +28,7 @@ from typing import Dict, Iterable, Iterator, List, Tuple
 import torch
 from tqdm import tqdm
 
-from bonito.crf.basecall import stitch_results
+from bonito.crf.basecall import stitch_results, beam_search, to_str
 from bonito.multiprocessing import process_cancel, thread_iter
 from bonito.reader import Reader
 from bonito.util import batchify, column_to_set, init, load_model, unbatchify
@@ -160,6 +160,38 @@ def build_single_read_outputs(stitched_outputs: Dict[str, object], device: str) 
     }
 
 
+def decode_basecall_beam_search(
+    stitched_outputs: Dict[str, object],
+    device: str,
+    reverse_output: bool,
+    beam_width: int,
+    beam_cut: float,
+    blank_score: float,
+) -> Dict[str, object]:
+    scores = stitched_outputs["base_scores"].unsqueeze(1).to(device=device)
+    if not str(device).startswith("cuda"):
+        raise RuntimeError("Beam-search basecalling currently requires a CUDA device in this script.")
+    with torch.inference_mode():
+        with torch.cuda.device(scores.device):
+            sequence, qstring, moves = beam_search(
+                scores,
+                beam_width=beam_width,
+                beam_cut=beam_cut,
+                scale=1.0,
+                offset=0.0,
+                blank_score=blank_score,
+            )
+    sequence_signal_order = to_str(sequence)
+    qstring_signal_order = to_str(qstring)
+    return {
+        "sequence_signal_order": sequence_signal_order,
+        "sequence": sequence_signal_order[::-1] if reverse_output else sequence_signal_order,
+        "qstring_signal_order": qstring_signal_order,
+        "qstring": qstring_signal_order[::-1] if reverse_output else qstring_signal_order,
+        "moves": moves.detach().cpu().numpy(),
+    }
+
+
 def orient_sites_for_output(site_predictions: List[Dict[str, object]], sequence_length: int, reverse_output: bool) -> List[Dict[str, object]]:
     if not reverse_output:
         ordered = []
@@ -202,6 +234,11 @@ def build_text_summary(summary: Dict[str, object]) -> str:
         "[settings]",
         f"weights: {summary['settings']['weights']}",
         f"mod_threshold: {summary['settings']['mod_threshold']}",
+        f"basecall_decoder: {summary['settings']['basecall_decoder']}",
+        f"mod_decoder: {summary['settings']['mod_decoder']}",
+        f"beam_width: {summary['settings']['beam_width']}",
+        f"beam_cut: {summary['settings']['beam_cut']}",
+        f"blank_score: {summary['settings']['blank_score']}",
         f"chunksize: {summary['settings']['chunksize']}",
         f"overlap: {summary['settings']['overlap']}",
         f"batchsize: {summary['settings']['batchsize']}",
@@ -275,8 +312,12 @@ def main(args):
                 "trimmed_samples",
                 "signal_length",
                 "sequence_length",
+                "qstring",
                 "sequence",
                 "sequence_signal_order",
+                "mod_sequence_length",
+                "mod_sequence",
+                "mod_sequence_signal_order",
             ],
             delimiter="\t",
         )
@@ -288,6 +329,7 @@ def main(args):
                 "read_id",
                 "filename",
                 "run_id",
+                "basecall_sequence_length",
                 "sequence_length",
                 "predicted_base_index_output",
                 "predicted_base_index_signal_order",
@@ -321,11 +363,21 @@ def main(args):
         for read, stitched_outputs in progress:
             num_reads_processed += 1
             single_outputs = build_single_read_outputs(stitched_outputs, device=device)
+            beam_basecall = decode_basecall_beam_search(
+                stitched_outputs,
+                device=device,
+                reverse_output=reverse_output,
+                beam_width=args.beam_width,
+                beam_cut=args.beam_cut,
+                blank_score=args.blank_score,
+            )
             sequence_signal_order = model.decode_batch(single_outputs)[0]
             site_prediction_record = model.predict_mods(single_outputs, mod_threshold=args.mod_threshold)[0]
 
-            sequence = sequence_signal_order[::-1] if reverse_output else sequence_signal_order
-            sequence_length = int(len(sequence_signal_order))
+            sequence = beam_basecall["sequence"]
+            sequence_length = int(len(sequence))
+            mod_sequence = sequence_signal_order[::-1] if reverse_output else sequence_signal_order
+            mod_sequence_length = int(len(sequence_signal_order))
             num_called_bases += sequence_length
 
             base_writer.writerow({
@@ -336,14 +388,18 @@ def main(args):
                 "trimmed_samples": int(getattr(read, "trimmed_samples", 0)),
                 "signal_length": int(len(read.signal)),
                 "sequence_length": sequence_length,
+                "qstring": beam_basecall["qstring"],
                 "sequence": sequence,
-                "sequence_signal_order": sequence_signal_order,
+                "sequence_signal_order": beam_basecall["sequence_signal_order"],
+                "mod_sequence_length": mod_sequence_length,
+                "mod_sequence": mod_sequence,
+                "mod_sequence_signal_order": sequence_signal_order,
             })
             write_fasta_record(fasta_fh, str(read.read_id), sequence)
 
             ordered_sites = orient_sites_for_output(
                 site_prediction_record.get("sites", []),
-                sequence_length=sequence_length,
+                sequence_length=mod_sequence_length,
                 reverse_output=reverse_output,
             )
             for site in ordered_sites:
@@ -356,7 +412,8 @@ def main(args):
                     "read_id": str(read.read_id),
                     "filename": str(getattr(read, "filename", "")),
                     "run_id": str(getattr(read, "run_id", "")),
-                    "sequence_length": sequence_length,
+                    "basecall_sequence_length": sequence_length,
+                    "sequence_length": mod_sequence_length,
                     "predicted_base_index_output": int(site["predicted_base_index_output"]),
                     "predicted_base_index_signal_order": int(site["predicted_base_index_signal_order"]),
                     "time_step": int(site["emit_position"]),
@@ -385,6 +442,11 @@ def main(args):
         "settings": {
             "weights": "last" if args.weights is None else args.weights,
             "mod_threshold": float(args.mod_threshold),
+            "basecall_decoder": "beam_search",
+            "mod_decoder": "viterbi",
+            "beam_width": int(args.beam_width),
+            "beam_cut": float(args.beam_cut),
+            "blank_score": float(args.blank_score),
             "chunksize": int(model.config["basecaller"]["chunksize"]),
             "overlap": int(model.config["basecaller"]["overlap"]),
             "batchsize": int(model.config["basecaller"]["batchsize"]),
@@ -425,6 +487,9 @@ def argparser() -> ArgumentParser:
     parser.add_argument("--overlap", default=None, type=int)
     parser.add_argument("--batchsize", default=None, type=int)
     parser.add_argument("--only-modified-sites", action="store_true", default=False)
+    parser.add_argument("--beam-width", default=32, type=int)
+    parser.add_argument("--beam-cut", default=100.0, type=float)
+    parser.add_argument("--blank-score", default=2.0, type=float)
     parser.add_argument("--no-half", action="store_true", default=False)
     parser.add_argument("--no-compile", action="store_true", default=False)
     parser.add_argument("--nondeterministic", action="store_true", default=False)
