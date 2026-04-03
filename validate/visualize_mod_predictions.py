@@ -36,6 +36,7 @@ except ImportError:
 
 from predict_mods_from_pod5 import (
     build_single_read_outputs,
+    decode_basecall_beam_search,
     get_reads,
     init,
     iter_stitched_outputs,
@@ -152,15 +153,46 @@ def align_official_to_predicted(pred_seq: str, official_seq: str) -> List[Option
     return mapped[: len(pred_seq)]
 
 
+def project_mod_sites_to_beam(
+    beam_sequence: str,
+    mod_sequence: str,
+    ordered_sites: List[Dict[str, object]],
+) -> List[Optional[Dict[str, object]]]:
+    beam_norm = normalize_seq(beam_sequence)
+    mod_norm = normalize_seq(mod_sequence)
+    result = edlib_align(beam_norm, mod_norm, mode="NW", task="path")
+    cigar = result.get("cigar", "")
+
+    projected: List[Optional[Dict[str, object]]] = []
+    beam_idx = 0
+    mod_idx = 0
+    for count, op in CIGAR_RE.findall(cigar):
+        n = int(count)
+        if op in ("=", "X"):
+            for _ in range(n):
+                projected.append(dict(ordered_sites[mod_idx]) if mod_idx < len(ordered_sites) else None)
+                beam_idx += 1
+                mod_idx += 1
+        elif op == "I":
+            for _ in range(n):
+                projected.append(None)
+                beam_idx += 1
+        elif op == "D":
+            mod_idx += n
+    if len(projected) < len(beam_sequence):
+        projected.extend([None] * (len(beam_sequence) - len(projected)))
+    return projected[: len(beam_sequence)]
+
+
 def save_read_plot(
     read,
-    sequence_output: str,
-    sequence_signal_order: str,
+    beam_sequence_output: str,
+    mod_sequence_output: str,
     ordered_sites: List[Dict[str, object]],
     official_sequence: Optional[str],
+    beam_moves: Optional[np.ndarray],
     stride: int,
     output_path: Path,
-    reverse_output: bool,
     max_annotations: int,
 ) -> None:
     signal = np.asarray(read.signal, dtype=np.float32)
@@ -173,33 +205,44 @@ def save_read_plot(
     signal_max = float(np.max(signal))
     signal_span = max(signal_max - signal_min, 1e-6)
 
-    emit_positions = np.asarray([int(site["emit_position"]) for site in ordered_sites], dtype=np.int64)
-    emit_signal_positions = np.clip(emit_positions * int(stride), 0, signal.size - 1) if emit_positions.size else emit_positions
-    pred_labels = [str(site["global_pred_label"]) for site in ordered_sites]
-    pred_bases = [str(site["base_label"]) for site in ordered_sites]
-    official_aligned = align_official_to_predicted(normalize_seq(sequence_output), normalize_seq(official_sequence)) if official_sequence else []
+    projected_sites = project_mod_sites_to_beam(beam_sequence_output, mod_sequence_output, ordered_sites)
+    official_aligned = align_official_to_predicted(normalize_seq(beam_sequence_output), normalize_seq(official_sequence)) if official_sequence else []
+
+    beam_positions: List[int] = []
+    if beam_moves is not None and len(beam_moves) == len(beam_sequence_output):
+        beam_positions = [max(0, min(int(pos) * int(stride), signal.size - 1)) for pos in beam_moves.tolist()]
+    else:
+        for beam_idx, site in enumerate(projected_sites):
+            if site is None:
+                beam_positions.append(-1)
+            else:
+                beam_positions.append(max(0, min(int(site["emit_position"]) * int(stride), signal.size - 1)))
 
     fig, ax_signal = plt.subplots(figsize=(18, 5.8))
 
     ax_signal.plot(plot_x, plot_signal, linewidth=0.9, color="#4c566a")
     ax_signal.set_xlabel("Signal sample index")
     ax_signal.set_ylabel("Normalized current")
-    ax_signal.set_title(f"{read.read_id}  |  called_bases={len(sequence_signal_order)}", fontsize=11)
+    ax_signal.set_title(f"{read.read_id}  |  beam_bases={len(beam_sequence_output)}", fontsize=11)
 
-    if emit_signal_positions.size:
-        line_alpha = min(0.18, max(0.03, 18.0 / max(len(emit_signal_positions), 1)))
-        for raw_x in emit_signal_positions:
+    valid_positions = [pos for pos in beam_positions if pos >= 0]
+    if valid_positions:
+        line_alpha = min(0.18, max(0.03, 18.0 / max(len(valid_positions), 1)))
+        for raw_x in valid_positions:
             ax_signal.axvline(int(raw_x), color="#8fbcbb", alpha=line_alpha, linewidth=0.6, zorder=0)
 
-        label_limit = min(len(ordered_sites), max_annotations) if max_annotations > 0 else len(ordered_sites)
-        annotate_stride = max(int(np.ceil(len(ordered_sites) / max(label_limit, 1))), 1) if ordered_sites else 1
+        label_limit = min(len(beam_sequence_output), max_annotations) if max_annotations > 0 else len(beam_sequence_output)
+        annotate_stride = max(int(np.ceil(len(beam_sequence_output) / max(label_limit, 1))), 1) if beam_sequence_output else 1
         ours_y = signal_max + (0.08 * signal_span)
         official_y = signal_max + (0.15 * signal_span)
-        for idx in range(0, len(ordered_sites), annotate_stride):
-            x_pos = int(emit_signal_positions[idx])
-            base_text = pred_bases[idx]
-            mod_text = pred_labels[idx]
-            color = "#d1495b" if "canonical" not in mod_text.lower() else "#2b6cb0"
+        for idx in range(0, len(beam_sequence_output), annotate_stride):
+            x_pos = beam_positions[idx] if idx < len(beam_positions) else -1
+            if x_pos < 0:
+                continue
+            base_text = beam_sequence_output[idx]
+            projected_site = projected_sites[idx] if idx < len(projected_sites) else None
+            mod_text = str(projected_site["global_pred_label"]) if projected_site is not None else "unmapped"
+            color = "#d1495b" if ("canonical" not in mod_text.lower() and projected_site is not None) else "#2b6cb0"
             ax_signal.text(
                 x_pos,
                 ours_y,
@@ -228,8 +271,8 @@ def save_read_plot(
     ax_signal.set_ylim(signal_min - (0.06 * signal_span), signal_max + (0.26 * signal_span))
     legend_handles = [
         Line2D([0], [0], color="#4c566a", lw=1.2, label="signal"),
-        Line2D([0], [0], marker="$A$", color="#2b6cb0", linestyle="None", markersize=10, label="canonical"),
-        Line2D([0], [0], marker="$A$", color="#d1495b", linestyle="None", markersize=10, label="m6A / modified"),
+        Line2D([0], [0], marker="$A$", color="#2b6cb0", linestyle="None", markersize=10, label="beam base + canonical"),
+        Line2D([0], [0], marker="$A$", color="#d1495b", linestyle="None", markersize=10, label="beam base + m6A / modified"),
     ]
     if official_sequence:
         legend_handles.append(Line2D([0], [0], marker="$A$", color="#444444", linestyle="None", markersize=10, label="official basecall"))
@@ -332,9 +375,18 @@ def main(args):
         ncols=100,
     ):
         single_outputs = build_single_read_outputs(stitched_outputs, device=device)
+        beam_basecall = decode_basecall_beam_search(
+            stitched_outputs,
+            device=device,
+            reverse_output=reverse_output,
+            beam_width=args.beam_width,
+            beam_cut=args.beam_cut,
+            blank_score=args.blank_score,
+        )
         sequence_signal_order = model.decode_batch(single_outputs)[0]
         site_prediction_record = model.predict_mods(single_outputs, mod_threshold=args.mod_threshold)[0]
-        sequence_output = sequence_signal_order[::-1] if reverse_output else sequence_signal_order
+        sequence_output = beam_basecall["sequence"]
+        mod_sequence_output = sequence_signal_order[::-1] if reverse_output else sequence_signal_order
         ordered_sites = orient_sites_for_output(
             site_prediction_record.get("sites", []),
             sequence_length=len(sequence_signal_order),
@@ -344,13 +396,13 @@ def main(args):
         png_path = out_dir / f"{read.read_id}.png"
         save_read_plot(
             read=read,
-            sequence_output=sequence_output,
-            sequence_signal_order=sequence_signal_order,
+            beam_sequence_output=sequence_output,
+            mod_sequence_output=mod_sequence_output,
             ordered_sites=ordered_sites,
             official_sequence=official_sequences.get(str(read.read_id)),
+            beam_moves=beam_basecall.get("moves"),
             stride=int(model.stride),
             output_path=png_path,
-            reverse_output=reverse_output,
             max_annotations=args.max_annotations,
         )
         written.append(png_path.name)
@@ -393,6 +445,9 @@ def argparser() -> ArgumentParser:
     parser.add_argument("--seed", default=25, type=int)
     parser.add_argument("--weights", default=None, type=int)
     parser.add_argument("--mod-threshold", default=0.5, type=float)
+    parser.add_argument("--beam-width", default=32, type=int)
+    parser.add_argument("--beam-cut", default=100.0, type=float)
+    parser.add_argument("--blank-score", default=2.0, type=float)
     parser.add_argument("--recursive", action="store_true", default=False)
     parser.add_argument("--no-trim", action="store_true", default=False)
     parser.add_argument("--chunksize", default=None, type=int)
