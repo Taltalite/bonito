@@ -66,7 +66,10 @@ def align(ref: str, seq: str) -> AlignResult:
     if not seq:
         return AlignResult(ref_len=len(ref), seq_len=0)
 
-    res = parasail.sw_trace_striped_32(seq, ref, 8, 4, parasail.dnafull)
+    try:
+        res = parasail.sw_trace_striped_32(seq, ref, 8, 4, parasail.dnafull)
+    except Exception:
+        return AlignResult(ref_len=len(ref), seq_len=len(seq))
     cigar = res.cigar.decode.decode()
     counts = defaultdict(int)
     for count, op in re.findall(r"(\d+)([A-Z\W])", cigar):
@@ -91,6 +94,15 @@ def align(ref: str, seq: str) -> AlignResult:
         align_seq_start=seq_start,
         align_seq_end=res.end_query,
     )
+
+
+def safe_accuracy(ref: str, seq: str) -> float:
+    if not ref or not seq:
+        return 0.0
+    try:
+        return float(accuracy(ref, seq, min_coverage=0.5))
+    except Exception:
+        return 0.0
 
 
 def confusion_matrix(true_labels: np.ndarray, pred_labels: np.ndarray, num_classes: int) -> np.ndarray:
@@ -915,7 +927,7 @@ def main(args):
 
             refs = [decode_ref(target, model.alphabet) for target in targets]
             refs = maybe_trim_refs(refs, model)
-            accs = [accuracy(ref, seq, min_coverage=0.5) if (ref and seq) else 0.0 for ref, seq in zip(refs, seqs)]
+            accs = [safe_accuracy(ref, seq) for ref, seq in zip(refs, seqs)]
 
             for local_idx, (ref, seq, acc_pct) in enumerate(zip(refs, seqs, accs)):
                 aln = align(ref, seq)
