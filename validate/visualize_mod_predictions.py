@@ -15,13 +15,16 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from collections import Counter
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+import pysam
 from tqdm import tqdm
+from edlib import align as edlib_align
 
 try:
     import matplotlib
@@ -40,6 +43,9 @@ from predict_mods_from_pod5 import (
     orient_sites_for_output,
     resolve_output_orientation,
 )
+
+
+CIGAR_RE = re.compile(r"(\d+)([=XID])")
 
 
 def load_requested_read_ids(path: str | None) -> List[str] | None:
@@ -101,11 +107,57 @@ def downsample_trace(x: np.ndarray, y: np.ndarray, max_points: int) -> Tuple[np.
     return x[idx], y[idx]
 
 
+def normalize_seq(seq: str, convert_u_to_t: bool = True) -> str:
+    text = str(seq or "").upper()
+    return text.replace("U", "T") if convert_u_to_t else text
+
+
+def load_official_sequences(path: Path, selected_read_ids: List[str], convert_u_to_t: bool = True) -> Dict[str, str]:
+    wanted = set(selected_read_ids)
+    sequences: Dict[str, str] = {}
+    with pysam.AlignmentFile(str(path), "rb", check_sq=False) as bam:
+        for read in bam:
+            if read.is_secondary or read.is_supplementary:
+                continue
+            read_id = str(read.query_name)
+            if read_id not in wanted or read_id in sequences or read.query_sequence is None:
+                continue
+            sequences[read_id] = normalize_seq(read.query_sequence, convert_u_to_t=convert_u_to_t)
+            if len(sequences) == len(wanted):
+                break
+    return sequences
+
+
+def align_official_to_predicted(pred_seq: str, official_seq: str) -> List[Optional[str]]:
+    result = edlib_align(pred_seq, official_seq, mode="NW", task="path")
+    cigar = result.get("cigar", "")
+    mapped: List[Optional[str]] = []
+    pred_idx = 0
+    off_idx = 0
+    for count, op in CIGAR_RE.findall(cigar):
+        n = int(count)
+        if op in ("=", "X"):
+            for _ in range(n):
+                mapped.append(official_seq[off_idx] if off_idx < len(official_seq) else None)
+                pred_idx += 1
+                off_idx += 1
+        elif op == "I":
+            for _ in range(n):
+                mapped.append(None)
+                pred_idx += 1
+        elif op == "D":
+            off_idx += n
+    if len(mapped) < len(pred_seq):
+        mapped.extend([None] * (len(pred_seq) - len(mapped)))
+    return mapped[: len(pred_seq)]
+
+
 def save_read_plot(
     read,
     sequence_output: str,
     sequence_signal_order: str,
     ordered_sites: List[Dict[str, object]],
+    official_sequence: Optional[str],
     stride: int,
     output_path: Path,
     reverse_output: bool,
@@ -125,6 +177,7 @@ def save_read_plot(
     emit_signal_positions = np.clip(emit_positions * int(stride), 0, signal.size - 1) if emit_positions.size else emit_positions
     pred_labels = [str(site["global_pred_label"]) for site in ordered_sites]
     pred_bases = [str(site["base_label"]) for site in ordered_sites]
+    official_aligned = align_official_to_predicted(normalize_seq(sequence_output), normalize_seq(official_sequence)) if official_sequence else []
 
     fig, ax_signal = plt.subplots(figsize=(18, 5.8))
 
@@ -140,7 +193,8 @@ def save_read_plot(
 
         label_limit = min(len(ordered_sites), max_annotations) if max_annotations > 0 else len(ordered_sites)
         annotate_stride = max(int(np.ceil(len(ordered_sites) / max(label_limit, 1))), 1) if ordered_sites else 1
-        base_y = signal_max + (0.08 * signal_span)
+        ours_y = signal_max + (0.08 * signal_span)
+        official_y = signal_max + (0.15 * signal_span)
         for idx in range(0, len(ordered_sites), annotate_stride):
             x_pos = int(emit_signal_positions[idx])
             base_text = pred_bases[idx]
@@ -148,7 +202,7 @@ def save_read_plot(
             color = "#d1495b" if "canonical" not in mod_text.lower() else "#2b6cb0"
             ax_signal.text(
                 x_pos,
-                base_y,
+                ours_y,
                 base_text,
                 fontsize=9.5,
                 ha="center",
@@ -157,13 +211,28 @@ def save_read_plot(
                 color=color,
                 fontweight="bold",
             )
+            if official_aligned:
+                off_base = official_aligned[idx] if idx < len(official_aligned) else None
+                if off_base:
+                    ax_signal.text(
+                        x_pos,
+                        official_y,
+                        off_base,
+                        fontsize=8.8,
+                        ha="center",
+                        va="bottom",
+                        rotation=90,
+                        color="#444444",
+                    )
 
-    ax_signal.set_ylim(signal_min - (0.06 * signal_span), signal_max + (0.18 * signal_span))
+    ax_signal.set_ylim(signal_min - (0.06 * signal_span), signal_max + (0.26 * signal_span))
     legend_handles = [
         Line2D([0], [0], color="#4c566a", lw=1.2, label="signal"),
         Line2D([0], [0], marker="$A$", color="#2b6cb0", linestyle="None", markersize=10, label="canonical"),
         Line2D([0], [0], marker="$A$", color="#d1495b", linestyle="None", markersize=10, label="m6A / modified"),
     ]
+    if official_sequence:
+        legend_handles.append(Line2D([0], [0], marker="$A$", color="#444444", linestyle="None", markersize=10, label="official basecall"))
     ax_signal.legend(handles=legend_handles, loc="upper right", fontsize=8, frameon=True)
 
     fig.tight_layout()
@@ -182,6 +251,7 @@ def build_text_summary(summary: Dict[str, object]) -> str:
         f"num_reads_requested: {summary['settings']['num_reads_requested']}",
         f"max_annotations: {summary['settings']['max_annotations']}",
         f"output_rna_orientation: {summary['settings']['output_rna_orientation']}",
+        f"has_official_bam: {summary['settings']['has_official_bam']}",
         "",
         "[counts]",
         f"num_plots_written: {summary['counts']['num_plots_written']}",
@@ -240,6 +310,11 @@ def main(args):
             fh.write(read_id + "\n")
 
     reads, _ = get_reads(reader_args, model)
+    official_sequences = (
+        load_official_sequences(Path(args.official_bam), selected_read_ids, convert_u_to_t=not args.keep_u)
+        if args.official_bam
+        else {}
+    )
     device = str(next(model.parameters()).device)
     written = []
 
@@ -272,6 +347,7 @@ def main(args):
             sequence_output=sequence_output,
             sequence_signal_order=sequence_signal_order,
             ordered_sites=ordered_sites,
+            official_sequence=official_sequences.get(str(read.read_id)),
             stride=int(model.stride),
             output_path=png_path,
             reverse_output=reverse_output,
@@ -287,6 +363,7 @@ def main(args):
             "num_reads_requested": int(args.num_reads),
             "max_annotations": int(args.max_annotations),
             "output_rna_orientation": bool(reverse_output),
+            "has_official_bam": bool(args.official_bam),
         },
         "counts": {
             "num_plots_written": int(len(written)),
@@ -309,6 +386,7 @@ def argparser() -> ArgumentParser:
     parser.add_argument("--mod-sites-tsv", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--read-ids", help="Optional file listing read IDs to visualize, one per line")
+    parser.add_argument("--official-bam", type=Path)
     parser.add_argument("--num-reads", default=10, type=int)
     parser.add_argument("--max-annotations", default=40, type=int)
     parser.add_argument("--device", default="cuda")
@@ -324,6 +402,7 @@ def argparser() -> ArgumentParser:
     parser.add_argument("--no-compile", action="store_true", default=False)
     parser.add_argument("--nondeterministic", action="store_true", default=False)
     parser.add_argument("--use-koi", action="store_true", default=False)
+    parser.add_argument("--keep-u", action="store_true", default=False, help="Do not normalize U->T for official BAM overlay")
 
     orientation_group = parser.add_mutually_exclusive_group()
     orientation_group.add_argument("--rna", dest="rna", action="store_true", default=None)
