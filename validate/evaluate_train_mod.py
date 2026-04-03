@@ -61,6 +61,8 @@ def safe_div(numerator: float, denominator: float) -> float:
 
 
 def align(ref: str, seq: str) -> AlignResult:
+    if not ref:
+        return AlignResult(ref_len=0, seq_len=len(seq), num_insertions=len(seq))
     if not seq:
         return AlignResult(ref_len=len(ref), seq_len=0)
 
@@ -913,7 +915,7 @@ def main(args):
 
             refs = [decode_ref(target, model.alphabet) for target in targets]
             refs = maybe_trim_refs(refs, model)
-            accs = [accuracy(ref, seq, min_coverage=0.5) if seq else 0.0 for ref, seq in zip(refs, seqs)]
+            accs = [accuracy(ref, seq, min_coverage=0.5) if (ref and seq) else 0.0 for ref, seq in zip(refs, seqs)]
 
             for local_idx, (ref, seq, acc_pct) in enumerate(zip(refs, seqs, accs)):
                 aln = align(ref, seq)
