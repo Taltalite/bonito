@@ -18,6 +18,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import sys
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
 from pathlib import Path
 from statistics import median
@@ -28,6 +29,18 @@ from edlib import align as edlib_align
 
 
 CIGAR_RE = re.compile(r"(\d+)([=XID])")
+
+
+def set_max_csv_field_size() -> None:
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return
+        except OverflowError:
+            limit //= 10
+            if limit <= 0:
+                raise
 
 
 def normalize_seq(seq: str, convert_u_to_t: bool = True) -> str:
@@ -110,6 +123,7 @@ def build_text_summary(summary: Dict[str, object]) -> str:
 def main(args):
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    set_max_csv_field_size()
 
     predicted = load_predicted_basecalls(Path(args.predicted_basecalls_tsv), convert_u_to_t=not args.keep_u)
     official = load_official_bam_sequences(Path(args.official_bam), convert_u_to_t=not args.keep_u, primary_only=not args.include_non_primary)
