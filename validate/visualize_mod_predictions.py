@@ -21,11 +21,13 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
 import numpy as np
+from tqdm import tqdm
 
 try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 except ImportError:
     plt = None
 
@@ -99,13 +101,6 @@ def downsample_trace(x: np.ndarray, y: np.ndarray, max_points: int) -> Tuple[np.
     return x[idx], y[idx]
 
 
-def build_site_summary(sites: List[Dict[str, object]]) -> Counter[str]:
-    counts: Counter[str] = Counter()
-    for site in sites:
-        counts[str(site["global_pred_label"])] += 1
-    return counts
-
-
 def save_read_plot(
     read,
     sequence_output: str,
@@ -128,99 +123,48 @@ def save_read_plot(
 
     emit_positions = np.asarray([int(site["emit_position"]) for site in ordered_sites], dtype=np.int64)
     emit_signal_positions = np.clip(emit_positions * int(stride), 0, signal.size - 1) if emit_positions.size else emit_positions
-    site_scores = np.asarray([float(site["score"]) for site in ordered_sites], dtype=np.float32)
     pred_labels = [str(site["global_pred_label"]) for site in ordered_sites]
     pred_bases = [str(site["base_label"]) for site in ordered_sites]
 
-    fig, ax_signal = plt.subplots(figsize=(18, 8))
-    ax_mod = ax_signal.twinx()
+    fig, ax_signal = plt.subplots(figsize=(18, 5.8))
 
-    ax_signal.plot(plot_x, plot_signal, linewidth=0.9, color="#4c566a", label="signal")
+    ax_signal.plot(plot_x, plot_signal, linewidth=0.9, color="#4c566a")
     ax_signal.set_xlabel("Signal sample index")
     ax_signal.set_ylabel("Normalized current")
-    ax_mod.set_ylabel("Predicted class confidence")
-    ax_mod.set_ylim(-0.08, 1.22)
-
-    title_lines = [
-        f"read_id={read.read_id}",
-        f"signal_len={len(read.signal)} called_bases={len(sequence_signal_order)} output_is_rna={reverse_output}",
-    ]
-    label_counts = build_site_summary(ordered_sites)
-    if label_counts:
-        title_lines.append("pred_labels=" + ", ".join(f"{k}:{v}" for k, v in sorted(label_counts.items())))
-    ax_signal.set_title("\n".join(title_lines))
+    ax_signal.set_title(f"{read.read_id}  |  called_bases={len(sequence_signal_order)}", fontsize=11)
 
     if emit_signal_positions.size:
         line_alpha = min(0.18, max(0.03, 18.0 / max(len(emit_signal_positions), 1)))
         for raw_x in emit_signal_positions:
             ax_signal.axvline(int(raw_x), color="#8fbcbb", alpha=line_alpha, linewidth=0.6, zorder=0)
 
-        ax_mod.plot(
-            emit_signal_positions,
-            site_scores,
-            color="#2ca02c",
-            linewidth=1.1,
-            alpha=0.9,
-            label="pred site score",
-        )
-        scatter_colors = ["#d62728" if "canonical" not in label.lower() else "#1f77b4" for label in pred_labels]
-        ax_mod.scatter(
-            emit_signal_positions,
-            site_scores,
-            c=scatter_colors,
-            s=24,
-            alpha=0.95,
-            edgecolors="black",
-            linewidths=0.25,
-            label="predicted sites",
-            zorder=4,
-        )
-
-        label_limit = min(len(ordered_sites), max_annotations)
-        annotate_stride = max(label_limit // 20, 1) if label_limit else 1
-        base_y = signal_max + (0.05 * signal_span)
-        for idx in range(0, label_limit, annotate_stride):
+        label_limit = min(len(ordered_sites), max_annotations) if max_annotations > 0 else len(ordered_sites)
+        annotate_stride = max(int(np.ceil(len(ordered_sites) / max(label_limit, 1))), 1) if ordered_sites else 1
+        base_y = signal_max + (0.08 * signal_span)
+        for idx in range(0, len(ordered_sites), annotate_stride):
             x_pos = int(emit_signal_positions[idx])
             base_text = pred_bases[idx]
             mod_text = pred_labels[idx]
-            color = "#bf616a" if "canonical" not in mod_text.lower() else "#5e81ac"
+            color = "#d1495b" if "canonical" not in mod_text.lower() else "#2b6cb0"
             ax_signal.text(
                 x_pos,
                 base_y,
                 base_text,
-                fontsize=9,
-                ha="center",
-                va="bottom",
-                rotation=90,
-                color="#2e3440",
-            )
-            ax_mod.text(
-                x_pos,
-                min(float(site_scores[idx]) + 0.05, 1.04),
-                mod_text,
-                fontsize=8,
+                fontsize=9.5,
                 ha="center",
                 va="bottom",
                 rotation=90,
                 color=color,
+                fontweight="bold",
             )
 
-    ax_signal.text(
-        0.01,
-        0.98,
-        f"output_sequence_prefix={sequence_output[:80]}",
-        transform=ax_signal.transAxes,
-        fontsize=9,
-        ha="left",
-        va="top",
-        color="#2e3440",
-        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.8, "edgecolor": "#d8dee9"},
-    )
-
-    signal_handles, signal_labels = ax_signal.get_legend_handles_labels()
-    mod_handles, mod_labels = ax_mod.get_legend_handles_labels()
-    if signal_handles or mod_handles:
-        ax_signal.legend(signal_handles + mod_handles, signal_labels + mod_labels, loc="upper left", fontsize=8)
+    ax_signal.set_ylim(signal_min - (0.06 * signal_span), signal_max + (0.18 * signal_span))
+    legend_handles = [
+        Line2D([0], [0], color="#4c566a", lw=1.2, label="signal"),
+        Line2D([0], [0], marker="$A$", color="#2b6cb0", linestyle="None", markersize=10, label="canonical"),
+        Line2D([0], [0], marker="$A$", color="#d1495b", linestyle="None", markersize=10, label="m6A / modified"),
+    ]
+    ax_signal.legend(handles=legend_handles, loc="upper right", fontsize=8, frameon=True)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=180, bbox_inches="tight")
