@@ -28,10 +28,10 @@ from typing import Dict, Iterable, Iterator, List, Tuple
 import torch
 from tqdm import tqdm
 
-from bonito.crf.basecall import stitch_results, beam_search, to_str
+from bonito.crf.basecall import compute_scores, stitch_results, to_str
 from bonito.multiprocessing import process_cancel, thread_iter
 from bonito.reader import Reader
-from bonito.util import batchify, column_to_set, init, load_model, unbatchify
+from bonito.util import batchify, chunk, column_to_set, init, load_model, unbatchify
 
 
 def resolve_output_orientation(args, model) -> bool:
@@ -160,35 +160,132 @@ def build_single_read_outputs(stitched_outputs: Dict[str, object], device: str) 
     }
 
 
+def trailing_run_length(seq: str, base: str) -> int:
+    count = 0
+    for char in reversed(seq):
+        if char != base:
+            break
+        count += 1
+    return count
+
+
+def trim_polyA_output(
+    sequence: str,
+    qstring: str,
+    moves,
+    strategy: str,
+    reverse_output: bool,
+) -> Dict[str, object]:
+    if str(strategy or "").strip() != "trim_polyA":
+        return {
+            "sequence": sequence,
+            "qstring": qstring,
+            "moves": moves,
+            "trim_applied": False,
+            "trimmed_bases": 0,
+            "trim_base": "",
+        }
+
+    # The local Bonito codebase does not expose a concrete trim_polyA implementation.
+    # Keep the behavior conservative and only trim a clear terminal RNA polyA/polyT tail.
+    if not reverse_output:
+        return {
+            "sequence": sequence,
+            "qstring": qstring,
+            "moves": moves,
+            "trim_applied": False,
+            "trimmed_bases": 0,
+            "trim_base": "",
+        }
+
+    trim_base = ""
+    trim_len = 0
+    for base in ("A", "T"):
+        run_len = trailing_run_length(sequence, base)
+        if run_len >= 20 and run_len > trim_len:
+            trim_len = run_len
+            trim_base = base
+
+    if trim_len == 0:
+        return {
+            "sequence": sequence,
+            "qstring": qstring,
+            "moves": moves,
+            "trim_applied": False,
+            "trimmed_bases": 0,
+            "trim_base": "",
+        }
+
+    new_len = len(sequence) - trim_len
+    return {
+        "sequence": sequence[:new_len],
+        "qstring": qstring[:new_len],
+        "moves": moves[:new_len] if moves is not None else None,
+        "trim_applied": True,
+        "trimmed_bases": trim_len,
+        "trim_base": trim_base,
+    }
+
+
 def decode_basecall_beam_search(
-    stitched_outputs: Dict[str, object],
-    device: str,
+    model,
+    read,
+    chunksize: int,
+    overlap: int,
     reverse_output: bool,
     beam_width: int,
     beam_cut: float,
     blank_score: float,
 ) -> Dict[str, object]:
-    scores = stitched_outputs["base_scores"].unsqueeze(1).to(device=device)
-    if not str(device).startswith("cuda"):
-        raise RuntimeError("Beam-search basecalling currently requires a CUDA device in this script.")
-    with torch.inference_mode():
-        with torch.cuda.device(scores.device):
-            sequence, qstring, moves = beam_search(
-                scores,
-                beam_width=beam_width,
-                beam_cut=beam_cut,
-                scale=1.0,
-                offset=0.0,
-                blank_score=blank_score,
-            )
-    sequence_signal_order = to_str(sequence)
-    qstring_signal_order = to_str(qstring)
+    attrs = compute_scores(
+        model,
+        chunk(torch.from_numpy(read.signal), chunksize, overlap),
+        beam_width=beam_width,
+        beam_cut=beam_cut,
+        scale=1.0,
+        offset=0.0,
+        blank_score=blank_score,
+        reverse=False,
+    )
+    stitched = stitch_results(attrs, len(read.signal), chunksize, overlap, model.stride, reverse=False)
+
+    raw_sequence_signal_order = to_str(stitched["sequence"])
+    raw_qstring_signal_order = to_str(stitched["qstring"])
+    raw_moves_signal_order = stitched["moves"].detach().cpu().numpy()
+
+    raw_sequence = raw_sequence_signal_order[::-1] if reverse_output else raw_sequence_signal_order
+    raw_qstring = raw_qstring_signal_order[::-1] if reverse_output else raw_qstring_signal_order
+    raw_moves = raw_moves_signal_order[::-1].copy() if reverse_output else raw_moves_signal_order.copy()
+
+    trim_result = trim_polyA_output(
+        sequence=raw_sequence,
+        qstring=raw_qstring,
+        moves=raw_moves,
+        strategy=model.config.get("qscore", {}).get("strategy", ""),
+        reverse_output=reverse_output,
+    )
+
+    sequence = str(trim_result["sequence"])
+    qstring = str(trim_result["qstring"])
+    moves = trim_result["moves"]
+    if moves is None:
+        moves = raw_moves[: len(sequence)]
+
+    sequence_signal_order = sequence[::-1] if reverse_output else sequence
+    qstring_signal_order = qstring[::-1] if reverse_output else qstring
     return {
+        "raw_sequence_signal_order": raw_sequence_signal_order,
+        "raw_sequence": raw_sequence,
+        "raw_qstring_signal_order": raw_qstring_signal_order,
+        "raw_qstring": raw_qstring,
         "sequence_signal_order": sequence_signal_order,
-        "sequence": sequence_signal_order[::-1] if reverse_output else sequence_signal_order,
+        "sequence": sequence,
         "qstring_signal_order": qstring_signal_order,
-        "qstring": qstring_signal_order[::-1] if reverse_output else qstring_signal_order,
-        "moves": moves.detach().cpu().numpy(),
+        "qstring": qstring,
+        "moves": moves,
+        "trim_applied": bool(trim_result["trim_applied"]),
+        "trimmed_bases": int(trim_result["trimmed_bases"]),
+        "trim_base": str(trim_result["trim_base"]),
     }
 
 
@@ -244,12 +341,15 @@ def build_text_summary(summary: Dict[str, object]) -> str:
         f"batchsize: {summary['settings']['batchsize']}",
         f"output_rna_orientation: {summary['settings']['output_rna_orientation']}",
         f"only_modified_sites: {summary['settings']['only_modified_sites']}",
+        f"qscore_strategy: {summary['settings']['qscore_strategy']}",
         "",
         "[counts]",
         f"num_reads: {counts['num_reads']}",
         f"num_called_bases: {counts['num_called_bases']}",
         f"num_mod_sites_written: {counts['num_mod_sites_written']}",
         f"num_predicted_modified_sites: {counts['num_predicted_modified_sites']}",
+        f"num_polyA_trimmed_reads: {counts['num_polyA_trimmed_reads']}",
+        f"num_polyA_trimmed_bases: {counts['num_polyA_trimmed_bases']}",
         "",
         "[predicted_mod_labels]",
     ]
@@ -295,6 +395,8 @@ def main(args):
     num_mod_sites_written = 0
     num_predicted_modified_sites = 0
     num_reads_processed = 0
+    num_polyA_trimmed_reads = 0
+    num_polyA_trimmed_bases = 0
     predicted_mod_labels: Counter[str] = Counter()
 
     with (
@@ -315,6 +417,13 @@ def main(args):
                 "qstring",
                 "sequence",
                 "sequence_signal_order",
+                "raw_sequence_length",
+                "raw_qstring",
+                "raw_sequence",
+                "raw_sequence_signal_order",
+                "polyA_trim_applied",
+                "polyA_trimmed_bases",
+                "polyA_trim_base",
                 "mod_sequence_length",
                 "mod_sequence",
                 "mod_sequence_signal_order",
@@ -364,8 +473,10 @@ def main(args):
             num_reads_processed += 1
             single_outputs = build_single_read_outputs(stitched_outputs, device=device)
             beam_basecall = decode_basecall_beam_search(
-                stitched_outputs,
-                device=device,
+                model=model,
+                read=read,
+                chunksize=model.config["basecaller"]["chunksize"],
+                overlap=model.config["basecaller"]["overlap"],
                 reverse_output=reverse_output,
                 beam_width=args.beam_width,
                 beam_cut=args.beam_cut,
@@ -376,9 +487,13 @@ def main(args):
 
             sequence = beam_basecall["sequence"]
             sequence_length = int(len(sequence))
+            raw_sequence_length = int(len(beam_basecall["raw_sequence"]))
             mod_sequence = sequence_signal_order[::-1] if reverse_output else sequence_signal_order
             mod_sequence_length = int(len(sequence_signal_order))
             num_called_bases += sequence_length
+            if beam_basecall["trim_applied"]:
+                num_polyA_trimmed_reads += 1
+                num_polyA_trimmed_bases += int(beam_basecall["trimmed_bases"])
 
             base_writer.writerow({
                 "read_id": str(read.read_id),
@@ -391,6 +506,13 @@ def main(args):
                 "qstring": beam_basecall["qstring"],
                 "sequence": sequence,
                 "sequence_signal_order": beam_basecall["sequence_signal_order"],
+                "raw_sequence_length": raw_sequence_length,
+                "raw_qstring": beam_basecall["raw_qstring"],
+                "raw_sequence": beam_basecall["raw_sequence"],
+                "raw_sequence_signal_order": beam_basecall["raw_sequence_signal_order"],
+                "polyA_trim_applied": int(beam_basecall["trim_applied"]),
+                "polyA_trimmed_bases": int(beam_basecall["trimmed_bases"]),
+                "polyA_trim_base": beam_basecall["trim_base"],
                 "mod_sequence_length": mod_sequence_length,
                 "mod_sequence": mod_sequence,
                 "mod_sequence_signal_order": sequence_signal_order,
@@ -452,12 +574,15 @@ def main(args):
             "batchsize": int(model.config["basecaller"]["batchsize"]),
             "output_rna_orientation": bool(reverse_output),
             "only_modified_sites": bool(args.only_modified_sites),
+            "qscore_strategy": str(model.config.get("qscore", {}).get("strategy", "")),
         },
         "counts": {
             "num_reads": int(num_reads_processed),
             "num_called_bases": int(num_called_bases),
             "num_mod_sites_written": int(num_mod_sites_written),
             "num_predicted_modified_sites": int(num_predicted_modified_sites),
+            "num_polyA_trimmed_reads": int(num_polyA_trimmed_reads),
+            "num_polyA_trimmed_bases": int(num_polyA_trimmed_bases),
         },
         "predicted_mod_labels": dict(sorted(predicted_mod_labels.items())),
     }

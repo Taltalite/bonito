@@ -376,8 +376,10 @@ def main(args):
     ):
         single_outputs = build_single_read_outputs(stitched_outputs, device=device)
         beam_basecall = decode_basecall_beam_search(
-            stitched_outputs,
-            device=device,
+            model=model,
+            read=read,
+            chunksize=model.config["basecaller"]["chunksize"],
+            overlap=model.config["basecaller"]["overlap"],
             reverse_output=reverse_output,
             beam_width=args.beam_width,
             beam_cut=args.beam_cut,
