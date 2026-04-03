@@ -30,7 +30,7 @@ import torch
 import torch.amp as amp
 from tqdm import tqdm
 
-from bonito.data import ComputeSettings, DataSettings, ModelSetup, load_mod_data
+from bonito.data import ComputeSettings, DataSettings, ModelSetup, load_data, load_mod_data
 from bonito.util import accuracy, decode_ref, init, load_model
 
 try:
@@ -61,10 +61,15 @@ def safe_div(numerator: float, denominator: float) -> float:
 
 
 def align(ref: str, seq: str) -> AlignResult:
+    if not ref:
+        return AlignResult(ref_len=0, seq_len=len(seq), num_insertions=len(seq))
     if not seq:
         return AlignResult(ref_len=len(ref), seq_len=0)
 
-    res = parasail.sw_trace_striped_32(seq, ref, 8, 4, parasail.dnafull)
+    try:
+        res = parasail.sw_trace_striped_32(seq, ref, 8, 4, parasail.dnafull)
+    except Exception:
+        return AlignResult(ref_len=len(ref), seq_len=len(seq))
     cigar = res.cigar.decode.decode()
     counts = defaultdict(int)
     for count, op in re.findall(r"(\d+)([A-Z\W])", cigar):
@@ -89,6 +94,15 @@ def align(ref: str, seq: str) -> AlignResult:
         align_seq_start=seq_start,
         align_seq_end=res.end_query,
     )
+
+
+def safe_accuracy(ref: str, seq: str) -> float:
+    if not ref or not seq:
+        return 0.0
+    try:
+        return float(accuracy(ref, seq, min_coverage=0.5))
+    except Exception:
+        return 0.0
 
 
 def confusion_matrix(true_labels: np.ndarray, pred_labels: np.ndarray, num_classes: int) -> np.ndarray:
@@ -830,8 +844,7 @@ def main(args):
         half=use_half,
         compile=not args.no_compile,
     )
-    if not hasattr(model, "align_predictions_to_targets") or not hasattr(model, "predict_mods"):
-        raise RuntimeError("Loaded model does not provide per-base modification alignment helpers.")
+    supports_mod_eval = hasattr(model, "align_predictions_to_targets") and hasattr(model, "predict_mods")
 
     standardisation = model.config.get("standardisation", {}) if args.standardise else {}
     model_setup = ModelSetup(
@@ -841,12 +854,20 @@ def main(args):
     )
     compute_settings = ComputeSettings(batch_size=args.batchsize, num_workers=args.num_workers, seed=args.seed)
     data_settings = resolve_data_settings(args)
-    train_loader, valid_loader = load_mod_data(data_settings, model_setup, compute_settings)
+    if supports_mod_eval:
+        train_loader, valid_loader = load_mod_data(data_settings, model_setup, compute_settings)
+    else:
+        train_loader, valid_loader = load_data(data_settings, model_setup, compute_settings)
     dataloader = valid_loader if args.dataset == "valid" else train_loader
 
     model_dtype = next(model.parameters()).dtype
     use_amp = str(args.device).startswith("cuda") and not args.no_amp
     warnings: List[str] = []
+    if not supports_mod_eval:
+        warnings.append(
+            "Loaded model does not provide modification-head helpers (predict_mods/align_predictions_to_targets). "
+            "This run will report basecalling-only metrics, and modification metrics will be marked as unavailable."
+        )
     if getattr(model, "mod_loss_weight", 1.0) == 0:
         warnings.append("model.mod_loss_weight is 0. The modification branch is not contributing to total_loss.")
     if plt is None:
@@ -866,21 +887,38 @@ def main(args):
 
     with torch.no_grad():
         for batch in tqdm(dataloader, total=len(dataloader), ascii=True, ncols=100, desc="evaluating"):
-            data, targets, lengths, mod_targets, *extra = batch
+            if supports_mod_eval:
+                data, targets, lengths, mod_targets, *extra = batch
+            else:
+                data, targets, lengths, *extra = batch
+                mod_targets = None
             data_cpu = data.detach().cpu()
             data = data.to(args.device, dtype=model_dtype, non_blocking=True)
             targets_device = targets.to(args.device, non_blocking=True)
             lengths_device = lengths.to(args.device, non_blocking=True)
-            mod_targets_device = mod_targets.to(args.device, non_blocking=True)
+            mod_targets_device = mod_targets.to(args.device, non_blocking=True) if mod_targets is not None else None
             extra_device = [x.to(args.device, non_blocking=True) for x in extra]
 
             with amp.autocast("cuda", enabled=use_amp):
                 outputs = model(data, *extra_device)
-                losses = model.loss(outputs, targets_device, lengths_device, mod_targets_device)
+                if supports_mod_eval:
+                    loss_outputs = model.loss(outputs, targets_device, lengths_device, mod_targets_device)
+                else:
+                    loss_outputs = model.loss(outputs, targets_device, lengths_device)
+
+            if isinstance(loss_outputs, dict):
+                losses = {
+                    "loss": float(loss_outputs.get("loss", loss_outputs.get("total_loss", 0.0))),
+                    "mod_loss": float(loss_outputs.get("mod_loss", 0.0)),
+                    "total_loss": float(loss_outputs.get("total_loss", loss_outputs.get("loss", 0.0))),
+                }
+            else:
+                scalar_loss = float(loss_outputs.item())
+                losses = {"loss": scalar_loss, "mod_loss": 0.0, "total_loss": scalar_loss}
 
             num_batches += 1
             for key in loss_sums:
-                loss_sums[key] += float(losses[key].item())
+                loss_sums[key] += float(losses[key])
 
             if hasattr(model, "decode_batch"):
                 seqs = model.decode_batch(outputs)
@@ -889,7 +927,7 @@ def main(args):
 
             refs = [decode_ref(target, model.alphabet) for target in targets]
             refs = maybe_trim_refs(refs, model)
-            accs = [accuracy(ref, seq, min_coverage=0.5) if seq else 0.0 for ref, seq in zip(refs, seqs)]
+            accs = [safe_accuracy(ref, seq) for ref, seq in zip(refs, seqs)]
 
             for local_idx, (ref, seq, acc_pct) in enumerate(zip(refs, seqs, accs)):
                 aln = align(ref, seq)
@@ -907,66 +945,67 @@ def main(args):
                         "accuracy_pct": acc_pct,
                     })
 
-            per_base_predictions = model.predict_mods(outputs, mod_threshold=args.mod_threshold)
-            remaining_site_slots = max(args.site_report_limit - len(mod_site_examples), 0)
-            projection = model.align_predictions_to_targets(
-                outputs,
-                targets_device,
-                lengths_device,
-                mod_targets_device,
-                mod_threshold=args.mod_threshold,
-                include_site_records=remaining_site_slots > 0,
-                site_record_limit=remaining_site_slots,
-            )
-            projection_batches.append(projection)
+            if supports_mod_eval:
+                per_base_predictions = model.predict_mods(outputs, mod_threshold=args.mod_threshold)
+                remaining_site_slots = max(args.site_report_limit - len(mod_site_examples), 0)
+                projection = model.align_predictions_to_targets(
+                    outputs,
+                    targets_device,
+                    lengths_device,
+                    mod_targets_device,
+                    mod_threshold=args.mod_threshold,
+                    include_site_records=remaining_site_slots > 0,
+                    site_record_limit=remaining_site_slots,
+                )
+                projection_batches.append(projection)
 
-            for local_idx, sample_record in enumerate(projection["sample_records"]):
-                mod_alignment_records.append({
-                    "chunk_index": global_chunk_index + local_idx,
-                    **sample_record,
-                })
-
-            for site_record in projection["site_records"]:
-                mod_site_examples.append({
-                    "chunk_index": global_chunk_index + int(site_record["sample_index_in_batch"]),
-                    **site_record,
-                })
-
-            for local_idx, prediction in enumerate(per_base_predictions):
-                site_predictions = list(prediction.get("sites", []))
-                if len(predicted_base_examples) < args.max_examples:
-                    score_preview = [float(site["score"]) for site in site_predictions[:40]]
-                    pred_preview = [site["global_pred_label"] for site in site_predictions[:40]]
-                    head_preview = [site["head_name"] for site in site_predictions[:40]]
-                    predicted_base_examples.append({
+                for local_idx, sample_record in enumerate(projection["sample_records"]):
+                    mod_alignment_records.append({
                         "chunk_index": global_chunk_index + local_idx,
-                        "predicted_base_len": len(prediction["sequence"]),
-                        "sequence_prefix": prediction["sequence"][:80],
-                        "first_20_time_steps": json.dumps(prediction["emit_positions"][:20]),
-                        "first_40_mod_scores": json.dumps(score_preview),
-                        "first_40_mod_preds": json.dumps(pred_preview),
-                        "first_40_heads": json.dumps(head_preview),
+                        **sample_record,
                     })
 
-                if len(signal_examples) < args.signal_example_limit:
-                    sample_sites = [
-                        dict(site_record)
-                        for site_record in projection["site_records"]
-                        if int(site_record["sample_index_in_batch"]) == local_idx
-                    ]
-                    if sample_sites:
-                        signal_examples.append({
+                for site_record in projection["site_records"]:
+                    mod_site_examples.append({
+                        "chunk_index": global_chunk_index + int(site_record["sample_index_in_batch"]),
+                        **site_record,
+                    })
+
+                for local_idx, prediction in enumerate(per_base_predictions):
+                    site_predictions = list(prediction.get("sites", []))
+                    if len(predicted_base_examples) < args.max_examples:
+                        score_preview = [float(site["score"]) for site in site_predictions[:40]]
+                        pred_preview = [site["global_pred_label"] for site in site_predictions[:40]]
+                        head_preview = [site["head_name"] for site in site_predictions[:40]]
+                        predicted_base_examples.append({
                             "chunk_index": global_chunk_index + local_idx,
-                            "signal": data_cpu[local_idx].reshape(-1).numpy().tolist(),
-                            "emit_positions": list(prediction["emit_positions"]),
-                            "base_labels": list(prediction["base_labels"]),
-                            "site_scores": [float(site["score"]) for site in site_predictions],
-                            "site_records": sample_sites,
                             "predicted_base_len": len(prediction["sequence"]),
-                            "target_len": int(projection["sample_records"][local_idx]["target_len"]),
-                            "target_coverage": float(projection["sample_records"][local_idx]["target_coverage"]),
-                            "valid_mod_coverage": float(projection["sample_records"][local_idx]["valid_mod_coverage"]),
+                            "sequence_prefix": prediction["sequence"][:80],
+                            "first_20_time_steps": json.dumps(prediction["emit_positions"][:20]),
+                            "first_40_mod_scores": json.dumps(score_preview),
+                            "first_40_mod_preds": json.dumps(pred_preview),
+                            "first_40_heads": json.dumps(head_preview),
                         })
+
+                    if len(signal_examples) < args.signal_example_limit:
+                        sample_sites = [
+                            dict(site_record)
+                            for site_record in projection["site_records"]
+                            if int(site_record["sample_index_in_batch"]) == local_idx
+                        ]
+                        if sample_sites:
+                            signal_examples.append({
+                                "chunk_index": global_chunk_index + local_idx,
+                                "signal": data_cpu[local_idx].reshape(-1).numpy().tolist(),
+                                "emit_positions": list(prediction["emit_positions"]),
+                                "base_labels": list(prediction["base_labels"]),
+                                "site_scores": [float(site["score"]) for site in site_predictions],
+                                "site_records": sample_sites,
+                                "predicted_base_len": len(prediction["sequence"]),
+                                "target_len": int(projection["sample_records"][local_idx]["target_len"]),
+                                "target_coverage": float(projection["sample_records"][local_idx]["target_coverage"]),
+                                "valid_mod_coverage": float(projection["sample_records"][local_idx]["valid_mod_coverage"]),
+                            })
 
             global_chunk_index += len(seqs)
 
@@ -990,7 +1029,8 @@ def main(args):
     }
 
     if alignment_df.empty:
-        warnings.append("No target-axis projection records were produced for the modification branch.")
+        if supports_mod_eval:
+            warnings.append("No target-axis projection records were produced for the modification branch.")
         alignment_summary = {
             "mean_target_coverage": 0.0,
             "mean_predicted_base_coverage": 0.0,
@@ -1012,45 +1052,82 @@ def main(args):
                 "This usually means base predictions and references are still too far apart for stable mod supervision."
             )
 
-    merged_projection = {
-        "per_head": {},
-        "sample_records": [],
-        "site_records": [],
-    }
-    for projection in projection_batches:
-        merged_projection["sample_records"].extend(projection["sample_records"])
-        merged_projection["site_records"].extend(projection["site_records"])
-        for head_name, head_projection in projection["per_head"].items():
-            merged_projection["per_head"].setdefault(head_name, {
-                "flat_logits": [],
-                "flat_targets": [],
-                "flat_global_targets": [],
-            })
-            for key in ("flat_logits", "flat_targets", "flat_global_targets"):
-                merged_projection["per_head"][head_name][key].append(head_projection[key].detach().cpu())
+    if supports_mod_eval:
+        merged_projection = {
+            "per_head": {},
+            "sample_records": [],
+            "site_records": [],
+        }
+        for projection in projection_batches:
+            merged_projection["sample_records"].extend(projection["sample_records"])
+            merged_projection["site_records"].extend(projection["site_records"])
+            for head_name, head_projection in projection["per_head"].items():
+                merged_projection["per_head"].setdefault(head_name, {
+                    "flat_logits": [],
+                    "flat_targets": [],
+                    "flat_global_targets": [],
+                })
+                for key in ("flat_logits", "flat_targets", "flat_global_targets"):
+                    merged_projection["per_head"][head_name][key].append(head_projection[key].detach().cpu())
 
-    for head_name, head_projection in merged_projection["per_head"].items():
-        flat_logits_parts = head_projection["flat_logits"]
-        flat_targets_parts = head_projection["flat_targets"]
-        flat_global_target_parts = head_projection["flat_global_targets"]
-        if flat_logits_parts:
-            head_projection["flat_logits"] = torch.cat(flat_logits_parts, dim=0)
-            head_projection["flat_targets"] = torch.cat(flat_targets_parts, dim=0)
-            head_projection["flat_global_targets"] = torch.cat(flat_global_target_parts, dim=0)
-        else:
-            num_classes = len(getattr(model, "mod_head_defs", {}).get(head_name, []))
-            head_projection["flat_logits"] = torch.zeros((0, num_classes), dtype=torch.float32)
-            head_projection["flat_targets"] = torch.zeros((0,), dtype=torch.long)
-            head_projection["flat_global_targets"] = torch.zeros((0,), dtype=torch.long)
+        for head_name, head_projection in merged_projection["per_head"].items():
+            flat_logits_parts = head_projection["flat_logits"]
+            flat_targets_parts = head_projection["flat_targets"]
+            flat_global_target_parts = head_projection["flat_global_targets"]
+            if flat_logits_parts:
+                head_projection["flat_logits"] = torch.cat(flat_logits_parts, dim=0)
+                head_projection["flat_targets"] = torch.cat(flat_targets_parts, dim=0)
+                head_projection["flat_global_targets"] = torch.cat(flat_global_target_parts, dim=0)
+            else:
+                num_classes = len(getattr(model, "mod_head_defs", {}).get(head_name, []))
+                head_projection["flat_logits"] = torch.zeros((0, num_classes), dtype=torch.float32)
+                head_projection["flat_targets"] = torch.zeros((0,), dtype=torch.long)
+                head_projection["flat_global_targets"] = torch.zeros((0,), dtype=torch.long)
 
-    mod_summary = aggregate_modification_metrics(model, merged_projection, args.mod_threshold)
-    if mod_summary["overall"]["num_sites"] == 0:
-        warnings.append("No aligned valid modification sites were available for evaluation.")
-    elif mod_summary["modified_vs_canonical"]["num_positive"] == 0 or mod_summary["modified_vs_canonical"]["num_negative"] == 0:
-        warnings.append(
-            "All aligned valid modification labels collapse to one side of the modified-vs-canonical split. "
-            "Binary discrimination metrics are therefore incomplete for this dataset."
-        )
+        mod_summary = aggregate_modification_metrics(model, merged_projection, args.mod_threshold)
+        if mod_summary["overall"]["num_sites"] == 0:
+            warnings.append("No aligned valid modification sites were available for evaluation.")
+        elif mod_summary["modified_vs_canonical"]["num_positive"] == 0 or mod_summary["modified_vs_canonical"]["num_negative"] == 0:
+            warnings.append(
+                "All aligned valid modification labels collapse to one side of the modified-vs-canonical split. "
+                "Binary discrimination metrics are therefore incomplete for this dataset."
+            )
+    else:
+        merged_projection = {"per_head": {}, "sample_records": [], "site_records": []}
+        mod_summary = {
+            "overall": {
+                "task_type": "unavailable",
+                "global_labels": [],
+                "num_sites": 0,
+                "accuracy": 0.0,
+                "macro_f1": 0.0,
+                "mean_confidence": 0.0,
+                "confusion_matrix": [],
+                "per_class": [],
+            },
+            "modified_vs_canonical": {
+                "task_type": "unavailable",
+                "threshold": args.mod_threshold,
+                "num_sites": 0,
+                "num_positive": 0,
+                "num_negative": 0,
+                "positive_rate": 0.0,
+                "predicted_positive_rate": 0.0,
+                "accuracy": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1": 0.0,
+                "tp": 0,
+                "tn": 0,
+                "fp": 0,
+                "fn": 0,
+                "mean_positive_prob": None,
+                "mean_negative_prob": None,
+                "roc_auc": None,
+                "pr_auc": None,
+            },
+            "per_head": {},
+        }
 
     summary = {
         "model_directory": str(Path(args.model_directory).resolve()),
@@ -1078,7 +1155,7 @@ def main(args):
     written_plots.extend(save_alignment_projection_plots(alignment_df, base_df, output_dir))
     binary_summary = summary["modification"]["modified_vs_canonical"]
     overall_summary = summary["modification"]["overall"]
-    if binary_summary["num_sites"] > 0:
+    if supports_mod_eval and binary_summary["num_sites"] > 0:
         binary_true = []
         binary_prob = []
         canonical_global_ids = {
@@ -1108,9 +1185,11 @@ def main(args):
             )
         )
     confusion = np.array(overall_summary["confusion_matrix"], dtype=np.int64)
-    written_plots.extend(save_multiclass_mod_plot(confusion, output_dir, class_labels=overall_summary.get("global_labels")))
+    if supports_mod_eval:
+        written_plots.extend(save_multiclass_mod_plot(confusion, output_dir, class_labels=overall_summary.get("global_labels")))
     written_plots.extend(save_training_curves(Path(args.model_directory), output_dir))
-    written_plots.extend(save_signal_alignment_examples(signal_examples, output_dir, stride=getattr(model, "stride", 1)))
+    if supports_mod_eval:
+        written_plots.extend(save_signal_alignment_examples(signal_examples, output_dir, stride=getattr(model, "stride", 1)))
 
     if plt is not None and not written_plots:
         warnings.append("No PNG plots were written. Check whether evaluation arrays were empty or training.csv was missing.")
