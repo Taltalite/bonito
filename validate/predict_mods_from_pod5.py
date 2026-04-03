@@ -227,6 +227,24 @@ def trim_polyA_output(
     }
 
 
+def prepare_base_scores_for_beam_search(model, base_scores: torch.Tensor) -> torch.Tensor:
+    scores = base_scores
+    if scores.ndim != 3:
+        raise ValueError(f"Expected base_scores with 3 dims, got shape {tuple(scores.shape)}")
+
+    # MultiHeadModel produces training-style CRF scores in TNC layout, often with
+    # expanded blank columns. Bonito's koi beam search expects chunk-first layout
+    # and the unexpanded CRF representation.
+    scores = scores.permute(1, 0, 2).contiguous()
+
+    n_base = int(model.seqdist.n_base)
+    expected_expanded = (n_base + 1) * (n_base ** model.seqdist.state_len)
+    if scores.shape[-1] == expected_expanded:
+        scores = scores.view(scores.shape[0], scores.shape[1], -1, n_base + 1)[..., 1:]
+        scores = scores.reshape(scores.shape[0], scores.shape[1], -1).contiguous()
+    return scores
+
+
 def decode_basecall_beam_search(
     model,
     read,
@@ -242,7 +260,7 @@ def decode_basecall_beam_search(
     batch = chunk(torch.from_numpy(read.signal), chunksize, overlap)
     with torch.inference_mode():
         outputs = model(batch.to(device=device, dtype=model_dtype, non_blocking=True))
-        scores = outputs["base_scores"]
+        scores = prepare_base_scores_for_beam_search(model, outputs["base_scores"])
         if not str(scores.device).startswith("cuda"):
             raise RuntimeError("Beam-search basecalling currently requires a CUDA device in this script.")
         with torch.cuda.device(scores.device):
