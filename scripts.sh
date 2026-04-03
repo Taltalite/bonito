@@ -407,3 +407,56 @@ python validate/kmer_balanced_mod_report.py \
   --max-per-class-per-kmer 500 \
   --positive-label-regex "(?i)m6a|modified" \
   --canonical-label-regex "(?i)canonical"
+
+# WT tetst
+
+python validate/predict_mods_from_pod5.py \
+    /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_15+15_ft \
+    /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/pod5 \
+    --output-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/my_pred \
+    --device cuda:0 \
+    --mod-threshold 0.5 \
+    --recursive
+
+python validate/compare_basecalls_to_official_bam.py \
+    --predicted-basecalls-tsv /home/lijy/workspace/bonito/validate/res/wt_my_pred/basecalls.tsv \
+    --official-bam /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/bam/PAU05273_pass_fd81c83d_c90ac4b0_10.sorted.bam \
+    --output-dir /home/lijy/workspace/bonito/validate/res/wt_my_pred_vs_official
+
+
+python validate/visualize_mod_predictions.py \
+    /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_15+15_ft \
+    /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/pod5 \
+    --mod-sites-tsv /home/lijy/workspace/bonito/validate/res/wt_my_pred/mod_site_predictions.tsv \
+    --output-dir /home/lijy/workspace/bonito/validate/res/wt_my_pred_vis \
+    --official-bam /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/bam/PAU05273_pass_fd81c83d_c90ac4b0_10.sorted.bam \
+    --device cuda:0 \
+    --num-reads 10 \
+    --recursive
+
+
+# WT new beam search
+
+python validate/predict_mods_from_pod5.py \
+    /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_15+15_ft \
+    /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/pod5 \
+    --output-dir /home/lijy/workspace/bonito/validate/res/wt_beam_search \
+    --device cuda:0 \
+    --mod-threshold 0.5 \
+    --recursive
+
+python validate/compare_basecalls_to_official_bam.py \
+    --predicted-basecalls-tsv /home/lijy/workspace/bonito/validate/res/wt_beam_search/basecalls.tsv \
+    --official-bam /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/bam/PAU05273_pass_fd81c83d_c90ac4b0_10.sorted.bam \
+    --output-dir /home/lijy/workspace/bonito/validate/res/wt_beam_search_vs_official
+
+
+python validate/visualize_mod_predictions.py \
+    /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_15+15_ft \
+    /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/pod5 \
+    --mod-sites-tsv /home/lijy/workspace/bonito/validate/res/wt_beam_search/mod_site_predictions.tsv \
+    --output-dir /home/lijy/workspace/bonito/validate/res/wt_beam_search_vis \
+    --official-bam /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/bam/PAU05273_pass_fd81c83d_c90ac4b0_10.sorted.bam \
+    --device cuda:0 \
+    --num-reads 10 \
+    --recursive
