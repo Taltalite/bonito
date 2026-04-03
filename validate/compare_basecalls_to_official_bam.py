@@ -48,6 +48,24 @@ def normalize_seq(seq: str, convert_u_to_t: bool = True) -> str:
     return text.replace("U", "T") if convert_u_to_t else text
 
 
+def leading_run_length(seq: str, base: str) -> int:
+    count = 0
+    for char in seq:
+        if char != base:
+            break
+        count += 1
+    return count
+
+
+def trailing_run_length(seq: str, base: str) -> int:
+    count = 0
+    for char in reversed(seq):
+        if char != base:
+            break
+        count += 1
+    return count
+
+
 def parse_cigar_counts(cigar: str) -> Dict[str, int]:
     counts = {"=": 0, "X": 0, "I": 0, "D": 0}
     for count, op in CIGAR_RE.findall(cigar or ""):
@@ -164,6 +182,7 @@ def main(args):
             "pred_length": pred_len,
             "official_length": official_len,
             "length_delta": pred_len - official_len,
+            "length_ratio": (float(pred_len) / official_len) if official_len else 0.0,
             "same_length": same_length,
             "identity": float(best_compare["identity"]),
             "edit_distance": int(best_compare["edit_distance"]),
@@ -171,8 +190,18 @@ def main(args):
             "mismatches": int(best_compare["mismatches"]),
             "insertions": int(best_compare["insertions"]),
             "deletions": int(best_compare["deletions"]),
+            "pred_prefix_a_run": leading_run_length(pred_seq, "A"),
+            "pred_suffix_a_run": trailing_run_length(pred_seq, "A"),
+            "pred_prefix_t_run": leading_run_length(pred_seq, "T"),
+            "pred_suffix_t_run": trailing_run_length(pred_seq, "T"),
+            "official_prefix_a_run": leading_run_length(official_seq, "A"),
+            "official_suffix_a_run": trailing_run_length(official_seq, "A"),
+            "official_prefix_t_run": leading_run_length(official_seq, "T"),
+            "official_suffix_t_run": trailing_run_length(official_seq, "T"),
             "pred_sequence_prefix": pred_seq[:120],
+            "pred_sequence_suffix": pred_seq[-120:],
             "official_sequence_prefix": official_seq[:120],
+            "official_sequence_suffix": official_seq[-120:],
         })
 
     rows.sort(key=lambda row: (row["identity"], row["edit_distance"], row["read_id"]))
@@ -188,6 +217,7 @@ def main(args):
         "pred_length",
         "official_length",
         "length_delta",
+        "length_ratio",
         "same_length",
         "identity",
         "edit_distance",
@@ -195,8 +225,18 @@ def main(args):
         "mismatches",
         "insertions",
         "deletions",
+        "pred_prefix_a_run",
+        "pred_suffix_a_run",
+        "pred_prefix_t_run",
+        "pred_suffix_t_run",
+        "official_prefix_a_run",
+        "official_suffix_a_run",
+        "official_prefix_t_run",
+        "official_suffix_t_run",
         "pred_sequence_prefix",
+        "pred_sequence_suffix",
         "official_sequence_prefix",
+        "official_sequence_suffix",
     ]
     with per_read_tsv.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames, delimiter="\t")
