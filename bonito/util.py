@@ -37,6 +37,7 @@ default_config = __dir__ / "models/configs/dna_r9.4.1@v3.1.toml"
 
 
 logger = getLogger('bonito')
+STANDALONE_MOD_HEAD_MODE = "standalone_mod_head"
 
 def init(seed, device, deterministic=True):
     """
@@ -275,6 +276,76 @@ def get_last_checkpoint(dirname):
     return os.path.join(dirname, 'weights_%s.tar' % weights)
 
 
+def resolve_model_dir(dirname):
+    dirname = os.path.expanduser(str(dirname))
+    if not os.path.isdir(dirname) and os.path.isdir(os.path.join(__models_dir__, dirname)):
+        dirname = os.path.join(__models_dir__, dirname)
+    return dirname
+
+
+def strip_module_prefix(state_dict):
+    return {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+
+def get_training_mode(config):
+    return str(config.get("training", {}).get("mode", "")).strip()
+
+
+def is_standalone_mod_head_config(config):
+    return get_training_mode(config) == STANDALONE_MOD_HEAD_MODE
+
+
+def get_standalone_pretrained_basecaller(config):
+    training_cfg = config.get("training", {})
+    for key in ("pretrained_basecaller", "pretrained_basecaller_dir", "pretrained"):
+        value = training_cfg.get(key)
+        if value:
+            return value
+    return None
+
+
+def load_matching_weights(model, state_dict, *, device=None, allow_remap=True):
+    state_dict = strip_module_prefix(state_dict)
+    model_state = model.state_dict()
+    matched = 0
+    remapped = None
+
+    if allow_remap and set(state_dict.keys()) != set(model_state.keys()):
+        try:
+            remapped = {
+                k2: state_dict[k1]
+                for k1, k2 in match_names(state_dict, model).items()
+            }
+        except AssertionError:
+            remapped = None
+
+    to_load = remapped if remapped is not None else state_dict
+    for name, value in to_load.items():
+        if name in model_state and model_state[name].shape == value.shape:
+            model_state[name] = value
+            matched += 1
+
+    model.load_state_dict(model_state)
+    skipped = len(to_load) - matched
+    stats = {"matched": matched, "skipped": skipped}
+    if device is not None:
+        stats["device"] = str(device)
+    return stats
+
+
+def load_pretrained_weights(model, pretrained, device):
+    dirname = resolve_model_dir(pretrained)
+    weights = get_last_checkpoint(dirname)
+    print(f"[loading pretrained weights] - {weights}")
+    state_dict = torch.load(weights, map_location=device, weights_only=False)
+    stats = load_matching_weights(model, state_dict, device=device)
+    stats["path"] = str(weights)
+    print(f"[loading pretrained weights] - matched={stats['matched']} skipped={stats['skipped']}")
+    if stats["matched"] == 0:
+        print("[warning] No pretrained weights matched current model parameters.")
+    return stats
+
+
 def set_config_defaults(config, chunksize=None, batchsize=None, overlap=None, quantize=False):
     basecall_params = config.get("basecaller", {})
     # use `value or dict.get(key)` rather than `dict.get(key, value)` to make
@@ -291,8 +362,7 @@ def load_model(dirname, device, weights=None, half=True, chunksize=None, batchsi
     """
     Load a model config and weights off disk from `dirname`.
     """
-    if not os.path.isdir(dirname) and os.path.isdir(os.path.join(__models_dir__, dirname)):
-        dirname = os.path.join(__models_dir__, dirname)
+    dirname = resolve_model_dir(dirname)
     weights = get_last_checkpoint(dirname) if weights is None else os.path.join(dirname, 'weights_%s.tar' % weights)
     config = toml.load(os.path.join(dirname, 'config.toml'))
     config['__config_dir__'] = str(Path(dirname).resolve())
@@ -304,6 +374,16 @@ def _load_model(model_file, config, device, half=True, use_koi=False, compile=Tr
     device = torch.device(device)
     Model = load_symbol(config, "Model")
     model = Model(config)
+    standalone_mod_head = is_standalone_mod_head_config(config)
+
+    if standalone_mod_head:
+        pretrained = get_standalone_pretrained_basecaller(config)
+        if not pretrained:
+            raise ValueError(
+                "Standalone mod-head configs must record training.pretrained_basecaller "
+                "so the frozen basecaller can be reconstructed."
+            )
+        load_pretrained_weights(model, pretrained, device)
 
     if use_koi:
         config["basecaller"]["chunksize"] -= config["basecaller"]["chunksize"] % model.stride
@@ -315,20 +395,23 @@ def _load_model(model_file, config, device, half=True, use_koi=False, compile=Tr
             quantize=config["basecaller"]["quantize"],
         )
 
-    state_dict = torch.load(model_file, map_location=device)
-    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-    model_state = model.state_dict()
-    if set(state_dict.keys()) == set(model_state.keys()):
-        model.load_state_dict(state_dict)
+    state_dict = torch.load(model_file, map_location=device, weights_only=False)
+    state_dict = strip_module_prefix(state_dict)
+    if standalone_mod_head and hasattr(model, "load_checkpoint_state_dict"):
+        model.load_checkpoint_state_dict(state_dict)
     else:
-        try:
-            remapped = {k2: state_dict[k1] for k1, k2 in match_names(state_dict, model).items()}
-        except AssertionError as exc:
-            raise ValueError(
-                "Model weights do not match the current model architecture. "
-                "Ensure the config.toml and weights_*.tar are from the same model."
-            ) from exc
-        model.load_state_dict(remapped)
+        model_state = model.state_dict()
+        if set(state_dict.keys()) == set(model_state.keys()):
+            model.load_state_dict(state_dict)
+        else:
+            try:
+                remapped = {k2: state_dict[k1] for k1, k2 in match_names(state_dict, model).items()}
+            except AssertionError as exc:
+                raise ValueError(
+                    "Model weights do not match the current model architecture. "
+                    "Ensure the config.toml and weights_*.tar are from the same model."
+                ) from exc
+            model.load_state_dict(remapped)
 
     if half:
         model = model.half()

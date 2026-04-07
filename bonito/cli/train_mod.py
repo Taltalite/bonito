@@ -14,41 +14,11 @@ import torch
 
 from bonito.training_mod import TrainerMod
 from bonito.data import load_mod_data, ModelSetup, ComputeSettings, DataSettings
-from bonito.util import __models_dir__, default_config, get_last_checkpoint, load_symbol, init
-
-
-def resolve_pretrained_dir(pretrained):
-    dirname = pretrained
-    if not os.path.isdir(dirname) and os.path.isdir(os.path.join(__models_dir__, dirname)):
-        dirname = os.path.join(__models_dir__, dirname)
-    return dirname
-
-
-def load_pretrained_weights(model, pretrained, device):
-    dirname = resolve_pretrained_dir(pretrained)
-
-    weights = get_last_checkpoint(dirname)
-    print(f"[loading pretrained weights] - {weights}")
-    state_dict = torch.load(weights, map_location=device)
-    state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
-
-    model_state = model.state_dict()
-    matched = 0
-    for name, value in state_dict.items():
-        if name in model_state and model_state[name].shape == value.shape:
-            model_state[name] = value
-            matched += 1
-
-    model.load_state_dict(model_state)
-    skipped = len(state_dict) - matched
-    print(f"[loading pretrained weights] - matched={matched} skipped={skipped}")
-    if matched == 0:
-        print("[warning] No pretrained weights matched current model parameters.")
-    return {"path": str(weights), "matched": matched, "skipped": skipped}
+from bonito.util import STANDALONE_MOD_HEAD_MODE, default_config, load_pretrained_weights, load_symbol, init, resolve_model_dir
 
 
 def load_pretrained_encoder_config(pretrained):
-    dirname = resolve_pretrained_dir(pretrained)
+    dirname = resolve_model_dir(pretrained)
     pretrain_file = os.path.join(dirname, "config.toml")
     if not os.path.exists(pretrain_file):
         raise FileNotFoundError(f"Pretrained config not found: {pretrain_file}")
@@ -116,13 +86,28 @@ def main(args):
 
     config = toml.load(args.config)
     config["__config_dir__"] = str(Path(args.config).resolve().parent)
+    standalone_mod_head = bool(args.pretrained and not args.joint_finetune)
+    training_mode = (
+        STANDALONE_MOD_HEAD_MODE
+        if standalone_mod_head
+        else ("joint_finetune" if args.pretrained else "scratch")
+    )
+    training_cfg = {
+        **config.get("training", {}),
+        **vars(args),
+        "pwd": os.getcwd(),
+        "mode": training_mode,
+    }
+    if args.pretrained:
+        training_cfg["pretrained"] = args.pretrained
+        training_cfg["pretrained_basecaller"] = args.pretrained
+        training_cfg["pretrained_basecaller_dir"] = resolve_model_dir(args.pretrained)
+        training_cfg["mod_head_weights_pattern"] = "weights_{epoch}.tar"
+    config["training"] = training_cfg
     if args.pretrained and "pretrained_encoder" not in config.get("model", {}):
         pretrained_encoder = load_pretrained_encoder_config(args.pretrained)
         if pretrained_encoder:
             config.setdefault("model", {})["pretrained_encoder"] = pretrained_encoder
-
-    argsdict = dict(training=vars(args))
-    argsdict["training"]["pwd"] = os.getcwd()
 
     print("[loading model]")
     model = load_symbol(config, 'Model')(config)
@@ -130,7 +115,11 @@ def main(args):
         preload_stats = load_pretrained_weights(model, args.pretrained, device)
     else:
         preload_stats = {}
-    apply_freeze_settings(model, args)
+    if standalone_mod_head:
+        if args.freeze_conv or args.freeze_base_head or args.freeze_encoder or args.freeze_encoder_layers > 0:
+            print("[freeze settings ignored] standalone mod-head mode freezes the full pretrained basecaller automatically.")
+    else:
+        apply_freeze_settings(model, args)
 
     try:
         model = torch.compile(model)
@@ -162,8 +151,8 @@ def main(args):
     except AttributeError:
         dataset_cfg = {}
     if preload_stats:
-        argsdict["training"]["pretrained_weights"] = preload_stats
-    toml.dump({**config, **argsdict, **dataset_cfg}, open(os.path.join(workdir, 'config.toml'), 'w'))
+        config["training"]["pretrained_weights"] = preload_stats
+    toml.dump({**config, **dataset_cfg}, open(os.path.join(workdir, 'config.toml'), 'w'))
 
     if config.get("lr_scheduler"):
         sched_config = config["lr_scheduler"]
@@ -201,6 +190,7 @@ def argparser():
     parser.add_argument("training_directory")
     parser.add_argument('--config', default=default_config)
     parser.add_argument('--pretrained', default="")
+    parser.add_argument("--joint-finetune", action="store_true", default=False)
     parser.add_argument("--freeze-conv", action="store_true", default=False)
     parser.add_argument("--freeze-base-head", action="store_true", default=False)
     parser.add_argument("--freeze-encoder", action="store_true", default=False)

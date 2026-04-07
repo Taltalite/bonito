@@ -9,8 +9,9 @@ from time import perf_counter
 from datetime import datetime
 
 from bonito.schedule import linear_warmup_cosine_decay
-from bonito.training import load_state
-from bonito.util import permute, decode_ref, accuracy, tqdm_environ, load_object
+from pathlib import Path
+
+from bonito.util import permute, decode_ref, accuracy, tqdm_environ, load_object, match_names, strip_module_prefix
 import bonito
 
 import torch
@@ -36,6 +37,55 @@ class ClipGrad:
         if not math.isnan(grad_norm):
             self.append(grad_norm)
         return grad_norm
+
+
+def load_state(dirname, device, model, optim=None):
+    """
+    Load a model state dict from disk, supporting standalone mod-head checkpoints.
+    """
+    dirname = Path(dirname)
+    model.to(device)
+    if hasattr(model, "module"):
+        model = model.module
+    elif hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+
+    to_load = [("weights", model)]
+    weight_files = dirname.glob("weights_*.tar")
+    weight_nos = {int(w.stem.split("_")[-1]) for w in weight_files}
+
+    if optim is not None:
+        to_load.append(("optim", optim))
+        optim_files = dirname.glob("optim_*.tar")
+        optim_nos = {int(w.stem.split("_")[-1]) for w in optim_files}
+        weight_no = max(optim_nos & weight_nos, default=None)
+    else:
+        weight_no = max(weight_nos, default=None)
+
+    if weight_no is None:
+        return 0
+
+    for name, obj in to_load:
+        print(f"[loading state] - {name}_{weight_no}.tar")
+        state_dict = torch.load(
+            dirname / f"{name}_{weight_no}.tar",
+            map_location=device,
+            weights_only=False,
+        )
+        if name == "weights":
+            state_dict = strip_module_prefix(state_dict)
+            if hasattr(obj, "load_checkpoint_state_dict"):
+                obj.load_checkpoint_state_dict(state_dict)
+            else:
+                state_dict = {
+                    k2.replace('module.', ''): state_dict[k1]
+                    for k1, k2 in match_names(state_dict, obj).items()
+                }
+                obj.load_state_dict(state_dict)
+        else:
+            obj.load_state_dict(state_dict)
+
+    return weight_no
 
 
 class TrainerMod:
@@ -66,6 +116,13 @@ class TrainerMod:
         self.chunks_per_epoch = chunks_per_epoch
         self.steps_per_epoch = chunks_per_epoch // batch_size
 
+    def _trainable_parameters(self):
+        if hasattr(self.model, "trainable_parameters"):
+            params = list(self.model.trainable_parameters())
+        else:
+            params = [param for param in self.model.parameters() if param.requires_grad]
+        return params
+
     def train_one_step(self, batch):
         self.optimizer.zero_grad()
         losses = None
@@ -92,7 +149,7 @@ class TrainerMod:
 
         scale = self.scaler.get_scale()
         self.scaler.unscale_(self.optimizer)
-        grad_norm = self.clip_grad(self.model.parameters())
+        grad_norm = self.clip_grad(self._trainable_parameters())
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
@@ -194,7 +251,10 @@ class TrainerMod:
 
         print(f"[loading optim] - '{optim_cls.__name__}' with args: {optim_kwargs}")
         optim_kwargs["lr"] = lr
-        self.optimizer = optim_cls(self.model.parameters(), **optim_kwargs)
+        trainable_parameters = self._trainable_parameters()
+        if not trainable_parameters:
+            raise ValueError("No trainable parameters were found for train_mod.")
+        self.optimizer = optim_cls(trainable_parameters, **optim_kwargs)
 
     def get_lr_scheduler(self, epochs, last_epoch=0):
         return self.lr_scheduler_fn(self.optimizer, self.steps_per_epoch, epochs, last_epoch)
@@ -216,7 +276,16 @@ class TrainerMod:
                 with bonito.io.CSVLogger(os.path.join(workdir, 'losses_{}.csv'.format(epoch))) as loss_log:
                     train_losses, duration = self.train_one_epoch(loss_log, lr_scheduler)
 
-                model_state = self.model.module.state_dict() if hasattr(self.model, 'module') else self.model.state_dict()
+                if hasattr(self.model, "module"):
+                    checkpoint_model = self.model.module
+                elif hasattr(self.model, "_orig_mod"):
+                    checkpoint_model = self.model._orig_mod
+                else:
+                    checkpoint_model = self.model
+                if hasattr(checkpoint_model, "checkpoint_state_dict"):
+                    model_state = checkpoint_model.checkpoint_state_dict()
+                else:
+                    model_state = checkpoint_model.state_dict()
                 torch.save(model_state, os.path.join(workdir, "weights_%s.tar" % epoch))
                 if epoch % self.save_optim_every == 0:
                     torch.save(self.optimizer.state_dict(), os.path.join(workdir, "optim_%s.tar" % epoch))
@@ -238,16 +307,20 @@ class TrainerMod:
 
             with bonito.io.CSVLogger(os.path.join(workdir, 'training.csv')) as training_log:
                 train_loss = train_losses.get("loss", None)
+                train_base_loss = train_losses.get("base_loss", None)
                 train_mod_loss = train_losses.get("mod_loss", None)
                 train_total_loss = train_losses.get("total_loss", None)
+                val_base_loss = val_losses.get("base_loss", None)
                 training_log.append({
                     "time": datetime.today(),
                     "epoch": epoch,
                     "train_loss": train_loss,
+                    "train_base_loss": train_base_loss,
                     "train_mod_loss": train_mod_loss,
                     "train_total_loss": train_total_loss,
                     "train_duration": duration,
                     "val_loss": val_loss,
+                    "val_base_loss": val_base_loss,
                     "val_mod_loss": val_mod_loss,
                     "val_total_loss": val_total_loss,
                     "val_mean": val_mean,

@@ -221,6 +221,25 @@ bonito train_mod runs/multihead_r9 \
   --directory /path/to/train_data \
   --config bonito/models/configs/multihead_transformer.toml \
   --pretrained dna_r10.4.1@v5.0 \
+```
+
+With `--pretrained`, `train_mod` now defaults to **standalone mod-head training**:
+
+- the pretrained basecaller is treated as immutable
+- only the modification branch is trainable
+- checkpoints store the modification branch weights only
+- loading the run later reconstructs the model by combining the recorded pretrained basecaller with the saved mod-head weights
+
+This is the recommended mode when you want to benchmark modification detection against the unchanged official basecaller output.
+
+To keep the legacy joint-finetuning behavior instead, opt out explicitly:
+
+```bash
+bonito train_mod runs/multihead_r9 \
+  --directory /path/to/train_data \
+  --config bonito/models/configs/multihead_transformer.toml \
+  --pretrained dna_r10.4.1@v5.0 \
+  --joint-finetune \
   --freeze-conv \
   --freeze-encoder-layers 2
 ```
@@ -240,6 +259,8 @@ runs/multihead_r9/
 ```
 
 `config.toml` now records saved dataset shape metadata for numpy datasets, which is useful when checking whether a run used the expected target width and modification target width.
+
+For standalone mod-head runs, `weights_*.tar` contains only the modification branch state. The run `config.toml` records the pretrained basecaller reference needed to reconstruct the full composite model during evaluation or inference.
 
 ## Resume Behavior
 

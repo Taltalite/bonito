@@ -5,6 +5,7 @@ Multi-head Transformer model with native Bonito CRF basecalling and per-base mod
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from typing import Dict, List, Tuple
 
 import edlib
@@ -34,6 +35,7 @@ DEFAULT_BASE_SLOT_ALIASES = {
     "T": ["T", "U"],
 }
 IGNORE_INDEX = -100
+STANDALONE_MOD_HEAD_MODE = "standalone_mod_head"
 
 
 class LightweightModBlock(torch.nn.Module):
@@ -231,6 +233,11 @@ class MultiHeadModel(torch.nn.Module):
 
         self.stride = stride
         self.config = config
+        self.training_mode = str(config.get("training", {}).get("mode", "")).strip()
+        self.standalone_mod_head = self.training_mode == STANDALONE_MOD_HEAD_MODE
+        if self.standalone_mod_head:
+            self._freeze_basecaller_parameters()
+            self._set_basecaller_eval()
 
     @staticmethod
     def _resolve_state_len(config, pretrained_encoder_cfg):
@@ -254,6 +261,83 @@ class MultiHeadModel(torch.nn.Module):
 
     def _base_slot_for_token(self, token_value: int) -> str | None:
         return self._base_slot_for_label(self._base_label(token_value))
+
+    def _basecalling_modules(self):
+        modules = []
+        for attr_name in ("encoder", "conv", "encoder_layers", "crf"):
+            module = getattr(self, attr_name, None)
+            if module is not None:
+                modules.append(module)
+        return modules
+
+    @staticmethod
+    def _freeze_module(module: torch.nn.Module) -> None:
+        for param in module.parameters():
+            param.requires_grad = False
+
+    def _freeze_basecaller_parameters(self) -> None:
+        for module in self._basecalling_modules():
+            self._freeze_module(module)
+
+    def _set_basecaller_eval(self) -> None:
+        for module in self._basecalling_modules():
+            module.eval()
+
+    def trainable_parameters(self):
+        return [param for param in self.parameters() if param.requires_grad]
+
+    @staticmethod
+    def _mod_branch_prefixes() -> Tuple[str, ...]:
+        return ("mod_input_proj.", "mod_trunk.", "mod_heads.")
+
+    def mod_branch_state_dict(self):
+        prefixes = self._mod_branch_prefixes()
+        return OrderedDict(
+            (name, value)
+            for name, value in self.state_dict().items()
+            if name.startswith(prefixes)
+        )
+
+    def load_mod_branch_state_dict(self, state_dict):
+        current_state = self.state_dict()
+        expected = set(self.mod_branch_state_dict().keys())
+        matched = set()
+        unexpected = []
+        shape_mismatches = []
+
+        for name, value in state_dict.items():
+            if name not in expected:
+                unexpected.append(name)
+                continue
+            if current_state[name].shape != value.shape:
+                shape_mismatches.append(f"{name}: expected {tuple(current_state[name].shape)} got {tuple(value.shape)}")
+                continue
+            current_state[name] = value
+            matched.add(name)
+
+        missing = sorted(expected - matched)
+        if unexpected or shape_mismatches or missing:
+            parts = []
+            if unexpected:
+                parts.append(f"unexpected={unexpected}")
+            if shape_mismatches:
+                parts.append(f"shape_mismatches={shape_mismatches}")
+            if missing:
+                parts.append(f"missing={missing}")
+            raise ValueError("Invalid standalone mod-head checkpoint: " + "; ".join(parts))
+
+        self.load_state_dict(current_state)
+
+    def checkpoint_state_dict(self):
+        if self.standalone_mod_head:
+            return self.mod_branch_state_dict()
+        return self.state_dict()
+
+    def load_checkpoint_state_dict(self, state_dict):
+        if self.standalone_mod_head:
+            self.load_mod_branch_state_dict(state_dict)
+            return
+        self.load_state_dict(state_dict)
 
     def _encode_features_and_base_scores(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
         if hasattr(self, "encoder"):
@@ -619,12 +703,22 @@ class MultiHeadModel(torch.nn.Module):
         else:
             mod_loss = weighted_mod_loss / contributing_sites
 
-        total_loss = base_loss + (self.mod_loss_weight * mod_loss)
+        if self.standalone_mod_head:
+            total_loss = self.mod_loss_weight * mod_loss
+        else:
+            total_loss = base_loss + (self.mod_loss_weight * mod_loss)
         return {
             "loss": base_loss,
+            "base_loss": base_loss,
             "mod_loss": mod_loss,
             "total_loss": total_loss,
         }
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if mode and self.standalone_mod_head:
+            self._set_basecaller_eval()
+        return self
 
 
 Model = MultiHeadModel
