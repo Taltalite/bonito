@@ -30,6 +30,7 @@ from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from pathlib import Path
+import tempfile
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mappy
@@ -48,6 +49,8 @@ STRICT_MIN_COVERAGE = 0.90
 RELAXED_MIN_ACCURACY = 0.95
 RELAXED_MIN_COVERAGE = 0.85
 FLUSH_SAMPLE_COUNT = 5000
+DEFAULT_TASK_BATCH_SIZE = 64
+DEFAULT_MAX_PENDING_BATCHES = 4
 
 
 def typical_indices(x: np.ndarray, n: float = 2.5) -> np.ndarray:
@@ -183,13 +186,18 @@ class WorkerState:
     pod5_lookup: Dict[str, Tuple[str, int, int]] = {}
     pod5_reader_cache: OrderedDict[str, pod5.Reader] = OrderedDict()
     aligner: Optional[mappy.Aligner] = None
+    temp_dir: Optional[str] = None
 
 
-def worker_init(reference_fasta: str, pod5_lookup: Dict[str, Tuple[str, int, int]], mm2_preset: str):
+PARENT_POD5_LOOKUP: Dict[str, Tuple[str, int, int]] = {}
+
+
+def worker_init(reference_fasta: str, pod5_lookup: Optional[Dict[str, Tuple[str, int, int]]], mm2_preset: str, temp_dir: str):
     os.environ["TMPDIR"] = "/tmp"
-    WorkerState.pod5_lookup = pod5_lookup
+    WorkerState.pod5_lookup = pod5_lookup if pod5_lookup is not None else PARENT_POD5_LOOKUP
     WorkerState.pod5_reader_cache = OrderedDict()
     WorkerState.aligner = mappy.Aligner(reference_fasta, preset=mm2_preset)
+    WorkerState.temp_dir = temp_dir
     if WorkerState.aligner is None:
         raise RuntimeError(f"Failed to build/load minimap2 index for {reference_fasta}")
 
@@ -450,6 +458,56 @@ def process_task(task: TaskData) -> Tuple[List[Sample], Dict[str, int]]:
     return samples, stats
 
 
+def merge_stats(total: Dict[str, int], update: Dict[str, int]) -> None:
+    for key, value in update.items():
+        total[key] = total.get(key, 0) + int(value)
+
+
+def write_worker_samples(samples: List[Sample]) -> Optional[Dict[str, object]]:
+    if not samples:
+        return None
+    temp_dir = WorkerState.temp_dir
+    if temp_dir is None:
+        raise RuntimeError("Worker temp_dir is not initialised.")
+    signals = np.stack([sample.signal for sample in samples], axis=0)
+    lengths = np.asarray([sample.label_len for sample in samples], dtype=np.uint16)
+    offsets = np.zeros((len(samples) + 1,), dtype=np.int64)
+    offsets[1:] = np.cumsum(lengths, dtype=np.int64)
+    labels_flat = np.concatenate([sample.label for sample in samples], axis=0)
+
+    with tempfile.NamedTemporaryFile(prefix="temp_sig_", suffix=".npy", dir=temp_dir, delete=False) as sig_tmp:
+        sig_path = sig_tmp.name
+    with tempfile.NamedTemporaryFile(prefix="temp_lbl_", suffix=".npy", dir=temp_dir, delete=False) as lbl_tmp:
+        lbl_path = lbl_tmp.name
+    with tempfile.NamedTemporaryFile(prefix="temp_off_", suffix=".npy", dir=temp_dir, delete=False) as off_tmp:
+        off_path = off_tmp.name
+    with tempfile.NamedTemporaryFile(prefix="temp_len_", suffix=".npy", dir=temp_dir, delete=False) as len_tmp:
+        len_path = len_tmp.name
+
+    np.save(sig_path, signals)
+    np.save(lbl_path, labels_flat)
+    np.save(off_path, offsets)
+    np.save(len_path, lengths)
+    return {
+        "signals": sig_path,
+        "labels": lbl_path,
+        "offsets": off_path,
+        "lengths": len_path,
+        "num_samples": int(signals.shape[0]),
+    }
+
+
+def process_task_batch(tasks: Sequence[TaskData]) -> Tuple[Optional[Dict[str, object]], Dict[str, int]]:
+    batch_stats: Dict[str, int] = {}
+    batch_samples: List[Sample] = []
+    for task in tasks:
+        samples, stats = process_task(task)
+        merge_stats(batch_stats, stats)
+        batch_samples.extend(samples)
+    manifest_entry = write_worker_samples(batch_samples)
+    return manifest_entry, batch_stats
+
+
 def flush_temp_chunk(chunk_id: int, chunk: List[Sample], temp_dir: Path, manifest: List[Dict[str, object]]) -> int:
     if not chunk:
         return chunk_id
@@ -603,6 +661,12 @@ def resolve_thresholds(args):
         args.min_coverage = default_coverage
 
 
+def resolve_mp_start_method(requested: str) -> str:
+    if requested != "auto":
+        return requested
+    return "fork" if os.name == "posix" else "spawn"
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--bam-file", required=True, help="Dorado basecaller BAM produced with --reference --emit-moves")
@@ -625,11 +689,13 @@ def parse_args():
     parser.add_argument("--pa-std", type=float, default=1.0)
     parser.add_argument("--mm2-preset", default="lr:hq", help="Minimap2 preset used for chunk-local realignment.")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--task-batch-size", type=int, default=DEFAULT_TASK_BATCH_SIZE)
+    parser.add_argument("--max-pending-batches", type=int, default=DEFAULT_MAX_PENDING_BATCHES)
+    parser.add_argument("--mp-start-method", choices=["auto", "fork", "spawn", "forkserver"], default="auto")
     return parser.parse_args()
 
 
 def main():
-    multiprocessing.set_start_method("spawn", force=True)
     os.environ["TMPDIR"] = "/tmp"
     args = parse_args()
     resolve_thresholds(args)
@@ -643,19 +709,27 @@ def main():
     print("[1/5] Building POD5 index...")
     lookup = build_pod5_lookup(Path(args.pod5_dir))
     print(f"      Found {len(lookup)} reads in POD5.")
+    start_method = resolve_mp_start_method(args.mp_start_method)
+    print(f"      multiprocessing start method: {start_method}")
 
     print("[2/5] Dispatching BAM records...")
     chunk_manifest: List[Dict[str, object]] = []
-    chunk_buffer: List[Sample] = []
     counters: Dict[str, int] = {}
-    chunk_id = 0
     task_count = 0
+    task_batch: List[TaskData] = []
+    max_pending_batches = max(int(args.max_pending_batches), 1) * max(int(args.workers), 1)
+    mp_context = multiprocessing.get_context(start_method)
+
+    global PARENT_POD5_LOOKUP
+    PARENT_POD5_LOOKUP = lookup
+    init_lookup = None if start_method == "fork" else lookup
 
     with pysam.AlignmentFile(args.bam_file, "rb", check_sq=False) as bam_file:
         with ProcessPoolExecutor(
             max_workers=args.workers,
+            mp_context=mp_context,
             initializer=worker_init,
-            initargs=(str(Path(args.reference_fasta).resolve()), lookup, args.mm2_preset),
+            initargs=(str(Path(args.reference_fasta).resolve()), init_lookup, args.mm2_preset, str(temp_dir.resolve())),
         ) as executor:
             futures = set()
             for read in tqdm(bam_file, desc="Dispatching", unit="record", ascii=True, ncols=100):
@@ -664,31 +738,33 @@ def main():
                 task = build_task(read, args)
                 if task is None:
                     continue
-                futures.add(executor.submit(process_task, task))
+                task_batch.append(task)
                 task_count += 1
-                if len(futures) >= args.workers * 10:
+
+                if len(task_batch) >= max(int(args.task_batch_size), 1):
+                    futures.add(executor.submit(process_task_batch, tuple(task_batch)))
+                    task_batch = []
+
+                if len(futures) >= max_pending_batches:
                     done, _ = wait(futures, return_when=FIRST_COMPLETED)
                     futures.difference_update(done)
                     for future in done:
-                        samples, stats = future.result()
-                        for key, value in stats.items():
-                            counters[key] = counters.get(key, 0) + int(value)
-                        chunk_buffer.extend(samples)
-                    if len(chunk_buffer) >= FLUSH_SAMPLE_COUNT:
-                        chunk_id = flush_temp_chunk(chunk_id, chunk_buffer, temp_dir, chunk_manifest)
-                        chunk_buffer = []
+                        manifest_entry, stats = future.result()
+                        merge_stats(counters, stats)
+                        if manifest_entry is not None:
+                            chunk_manifest.append(manifest_entry)
+
+            if task_batch:
+                futures.add(executor.submit(process_task_batch, tuple(task_batch)))
+                task_batch = []
 
             for future in tqdm(as_completed(futures), total=len(futures), desc="Finishing", ascii=True, ncols=100):
-                samples, stats = future.result()
-                for key, value in stats.items():
-                    counters[key] = counters.get(key, 0) + int(value)
-                chunk_buffer.extend(samples)
-                if len(chunk_buffer) >= FLUSH_SAMPLE_COUNT:
-                    chunk_id = flush_temp_chunk(chunk_id, chunk_buffer, temp_dir, chunk_manifest)
-                    chunk_buffer = []
+                manifest_entry, stats = future.result()
+                merge_stats(counters, stats)
+                if manifest_entry is not None:
+                    chunk_manifest.append(manifest_entry)
 
-    if chunk_buffer:
-        chunk_id = flush_temp_chunk(chunk_id, chunk_buffer, temp_dir, chunk_manifest)
+    PARENT_POD5_LOOKUP = {}
 
     print("[3/5] Merging passing chunks into final dataset...")
     merge_stats = merge_chunks_to_final(output_dir, chunk_manifest, int(args.chunk_len), args.max_label_len)
