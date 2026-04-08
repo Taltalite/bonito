@@ -30,7 +30,8 @@ import torch
 import torch.amp as amp
 from tqdm import tqdm
 
-from bonito.data import ComputeSettings, DataSettings, ModelSetup, load_data, load_mod_data
+from bonito.data import ComputeSettings, DataSettings, ModelSetup, load_data
+from bonito.train_mod_data import load_train_mod_data
 from bonito.util import accuracy, decode_ref, init, load_model
 
 try:
@@ -855,7 +856,7 @@ def main(args):
     compute_settings = ComputeSettings(batch_size=args.batchsize, num_workers=args.num_workers, seed=args.seed)
     data_settings = resolve_data_settings(args)
     if supports_mod_eval:
-        train_loader, valid_loader = load_mod_data(data_settings, model_setup, compute_settings)
+        train_loader, valid_loader = load_train_mod_data(data_settings, model_setup, compute_settings)
     else:
         train_loader, valid_loader = load_data(data_settings, model_setup, compute_settings)
     dataloader = valid_loader if args.dataset == "valid" else train_loader

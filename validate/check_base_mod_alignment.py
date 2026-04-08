@@ -27,7 +27,8 @@ import torch
 import torch.amp as amp
 from tqdm import tqdm
 
-from bonito.data import ComputeSettings, DataSettings, ModelSetup, load_mod_data
+from bonito.data import ComputeSettings, DataSettings, ModelSetup
+from bonito.train_mod_data import load_train_mod_data
 from bonito.util import init, load_model
 
 try:
@@ -128,7 +129,7 @@ def main(args):
     )
     compute_settings = ComputeSettings(batch_size=args.batchsize, num_workers=args.num_workers, seed=args.seed)
     data_settings = resolve_data_settings(args)
-    train_loader, valid_loader = load_mod_data(data_settings, model_setup, compute_settings)
+    train_loader, valid_loader = load_train_mod_data(data_settings, model_setup, compute_settings)
     dataloader = valid_loader if args.dataset == "valid" else train_loader
 
     model_dtype = next(model.parameters()).dtype
