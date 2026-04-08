@@ -489,3 +489,14 @@ python validate/evaluate_train_mod.py \
   --batchsize 64 \
   --device cuda:0 \
   --output-dir /home/lijy/workspace/bonito/validate/res/rna004_m6a_mix_only_ft/validate_epoch30
+
+
+python validate/evaluate_train_mod.py \
+  --model_directory /home/lijy/workspace/bonito/bonito/models/rna004_130bps_sup@v5.2.0 \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_15wmod+15wcan \
+  --dataset valid \
+  --chunks 50000 \
+  --valid-chunks 5000 \
+  --batchsize 64 \
+  --device cuda:0 \
+  --output-dir /home/lijy/workspace/bonito/validate/res/rna004_sup_520/validate_50000chunks

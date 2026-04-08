@@ -82,3 +82,18 @@ python merge_mod_datasets.py \
 samtools sort -@ 8 /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/bam/PAU05273_pass_fd81c83d_c90ac4b0_10.bam -o /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/bam/PAU05273_pass_fd81c83d_c90ac4b0_10.sorted.bam
 
 samtools index /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/bam/PAU05273_pass_fd81c83d_c90ac4b0_10.sorted.bam
+
+
+# bonito --save-ctc
+
+bonito basecaller /home/lijy/workspace/bonito/bonito/models/rna004_130bps_sup@v5.2.0 \
+  --reference /data/biolab-nvme-pcie2/lijy/HG002/hg38.fa \
+  --save-ctc \
+  --rna \
+  --device cuda:0 \
+  --batchsize 192 \
+  --chunksize 12000 \
+  --overlap 600 \
+  --max-reads 100000 \
+  --min-accuracy-save-ctc 0.99 \
+  /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mod/src_data/ > /data/biolab-nvme-pcie2/lijy/m6A/bonito_rna004_sup/mod/PAW43156_92158b33_73a20312_4_10wreads.bam
