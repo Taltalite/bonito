@@ -619,7 +619,13 @@ def find_chunk_index(starts: Sequence[int], index: int) -> int:
     return lo
 
 
-def merge_chunks_to_final(output_dir: Path, chunk_manifest: List[Dict[str, object]], signal_len: int, max_label_len: Optional[int]) -> Dict[str, int]:
+def merge_chunks_to_final(
+    output_dir: Path,
+    chunk_manifest: List[Dict[str, object]],
+    signal_len: int,
+    max_label_len: Optional[int],
+    max_chunks: int,
+) -> Dict[str, int]:
     if not chunk_manifest:
         raise RuntimeError("No valid samples remained after filtering.")
 
@@ -630,10 +636,15 @@ def merge_chunks_to_final(output_dir: Path, chunk_manifest: List[Dict[str, objec
     keep_indices = typical_indices(lengths)
     if keep_indices.size == 0:
         raise RuntimeError("No samples remained after typical-length filtering.")
-    if max_label_len is None:
-        max_label_len = int(lengths[keep_indices].max())
+    total_post_typical_filter = int(keep_indices.size)
 
     keep_indices = np.random.permutation(keep_indices)
+    if max_chunks > 0:
+        keep_indices = keep_indices[:max_chunks]
+    if keep_indices.size == 0:
+        raise RuntimeError("No samples remained after applying max_chunks.")
+    if max_label_len is None:
+        max_label_len = int(lengths[keep_indices].max())
     total_samples = int(keep_indices.size)
 
     chunks_out = np.lib.format.open_memmap(output_dir / "chunks.npy", mode="w+", dtype=np.float16, shape=(total_samples, signal_len))
@@ -684,8 +695,10 @@ def merge_chunks_to_final(output_dir: Path, chunk_manifest: List[Dict[str, objec
 
     return {
         "total_pre_typical_filter": int(lengths.shape[0]),
+        "total_post_typical_filter": total_post_typical_filter,
         "total_written": total_samples,
         "max_label_len": int(max_label_len),
+        "max_chunks_requested": None if max_chunks <= 0 else int(max_chunks),
     }
 
 
@@ -698,6 +711,7 @@ def write_summary(output_dir: Path, args, counters: Dict[str, int], merge_stats:
         "sample_type": args.sample_type,
         "chunk_len": int(args.chunk_len),
         "overlap": int(args.overlap),
+        "max_chunks": None if int(args.max_chunks) <= 0 else int(args.max_chunks),
         "min_accuracy": float(args.min_accuracy),
         "min_coverage": float(args.min_coverage),
         "min_qscore": None if args.min_qscore is None else float(args.min_qscore),
@@ -740,6 +754,7 @@ def parse_args():
     parser.add_argument("--overlap", type=int, default=600)
     parser.add_argument("--max-label-len", type=int, default=None)
     parser.add_argument("--max-records", type=int, default=-1)
+    parser.add_argument("--max-chunks", type=int, default=-1, help="Maximum number of passing chunks to write. Early-stops dispatching and also hard-caps final dataset size.")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--clip-value", type=float, default=5.0)
     parser.add_argument("--filter-preset", choices=["strict", "relaxed"], default="strict")
@@ -799,6 +814,7 @@ def main():
     task_count = 0
     task_batch: List[TaskData] = []
     max_pending_batches = max(int(args.max_pending_batches), 1)
+    max_chunks = int(args.max_chunks)
     mp_context = multiprocessing.get_context(start_method)
 
     global PARENT_POD5_LOOKUP
@@ -821,7 +837,10 @@ def main():
     try:
         with pysam.AlignmentFile(args.bam_file, "rb", check_sq=False) as bam_file:
             futures = set()
+            stop_dispatch = False
             for read in tqdm(bam_file, desc="Dispatching", unit="record", ascii=True, ncols=100):
+                if stop_dispatch:
+                    break
                 if args.max_records > 0 and task_count >= args.max_records:
                     break
                 task = build_task(read, args)
@@ -843,8 +862,13 @@ def main():
                         manifest_entries, stats = future.result()
                         merge_counters(counters, stats)
                         chunk_manifest.extend(manifest_entries)
+                        if max_chunks > 0 and counters.get("chunks_written", 0) >= max_chunks:
+                            stop_dispatch = True
+                    if stop_dispatch:
+                        print(f"      reached max_chunks={max_chunks}; stopping new task dispatch and draining in-flight batches...")
+                        break
 
-            if task_batch:
+            if task_batch and not stop_dispatch:
                 futures.add(executor.submit(process_task_batch, tuple(task_batch), int(args.max_samples_per_worker_file)))
                 task_batch = []
 
@@ -869,7 +893,13 @@ def main():
         gc.collect()
 
     print("[4/5] Merging passing chunks into final dataset...")
-    merge_summary = merge_chunks_to_final(output_dir, chunk_manifest, int(args.chunk_len), args.max_label_len)
+    merge_summary = merge_chunks_to_final(
+        output_dir,
+        chunk_manifest,
+        int(args.chunk_len),
+        args.max_label_len,
+        max_chunks,
+    )
 
     print("[5/5] Writing summary...")
     write_summary(output_dir, args, counters, merge_summary)
