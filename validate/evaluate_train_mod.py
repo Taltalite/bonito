@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import edlib
 import numpy as np
 import pandas as pd
 import parasail
@@ -55,6 +56,9 @@ class AlignResult:
     align_ref_end: int = 0
     align_seq_start: int = 0
     align_seq_end: int = 0
+
+
+_EDLIB_CIGAR_RE = re.compile(r"(\d+)([=XID])")
 
 
 def safe_div(numerator: float, denominator: float) -> float:
@@ -104,6 +108,41 @@ def safe_accuracy(ref: str, seq: str) -> float:
         return float(accuracy(ref, seq, min_coverage=0.5))
     except Exception:
         return 0.0
+
+
+def count_equal_alignment_bases(query_seq: str, target_seq: str) -> int:
+    if not query_seq or not target_seq:
+        return 0
+    try:
+        result = edlib.align(query_seq, target_seq, mode="NW", task="path")
+    except Exception:
+        return 0
+    cigar = result.get("cigar")
+    if not cigar:
+        return 0
+    return sum(
+        int(count)
+        for count, op in _EDLIB_CIGAR_RE.findall(cigar)
+        if op == "="
+    )
+
+
+def build_base_alignment_record(ref: str, seq: str) -> Dict[str, object]:
+    aligned_equal = count_equal_alignment_bases(seq, ref)
+    target_len = len(ref)
+    pred_len = len(seq)
+    return {
+        "aligned_equal_bases": int(aligned_equal),
+        "target_coverage": float(aligned_equal / target_len) if target_len else 0.0,
+        "predicted_base_coverage": float(aligned_equal / pred_len) if pred_len else 0.0,
+        "valid_target_mod_sites": 0,
+        "aligned_valid_mod_sites": 0,
+        "valid_mod_coverage": np.nan,
+        "predicted_base_len": pred_len,
+        "target_len": target_len,
+        "pred_sequence_prefix": seq[:80],
+        "target_sequence_prefix": ref[:80],
+    }
 
 
 def confusion_matrix(true_labels: np.ndarray, pred_labels: np.ndarray, num_classes: int) -> np.ndarray:
@@ -591,22 +630,33 @@ def save_alignment_projection_plots(alignment_df: pd.DataFrame, base_df: pd.Data
     if plt is None or alignment_df.empty:
         return written
 
+    valid_mod_series = pd.to_numeric(alignment_df.get("valid_mod_coverage"), errors="coerce")
+    has_valid_mod_coverage = valid_mod_series.notna().any()
+
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
     axes[0].hist(alignment_df["target_coverage"], bins=25, alpha=0.7, label="target coverage", color="#1f77b4")
-    axes[0].hist(alignment_df["valid_mod_coverage"], bins=25, alpha=0.7, label="valid mod coverage", color="#d62728")
-    axes[0].set_title("Per-base Projection Coverage")
+    axes[0].hist(alignment_df["predicted_base_coverage"], bins=25, alpha=0.7, label="predicted base coverage", color="#ff7f0e")
+    if has_valid_mod_coverage:
+        axes[0].hist(valid_mod_series.dropna(), bins=25, alpha=0.7, label="valid mod coverage", color="#d62728")
+    axes[0].set_title("Alignment Coverage")
     axes[0].set_xlabel("Coverage")
     axes[0].set_ylabel("Chunks")
     axes[0].legend()
 
     if not base_df.empty and "accuracy_pct" in base_df.columns:
-        axes[1].scatter(base_df["accuracy_pct"], alignment_df["valid_mod_coverage"], s=14, alpha=0.7, color="#2ca02c")
+        y_values = valid_mod_series if has_valid_mod_coverage else alignment_df["predicted_base_coverage"]
+        axes[1].scatter(base_df["accuracy_pct"], y_values, s=14, alpha=0.7, color="#2ca02c")
         axes[1].set_xlabel("Base accuracy (%)")
     else:
-        axes[1].scatter(np.arange(len(alignment_df)), alignment_df["valid_mod_coverage"], s=14, alpha=0.7, color="#2ca02c")
+        y_values = valid_mod_series if has_valid_mod_coverage else alignment_df["predicted_base_coverage"]
+        axes[1].scatter(np.arange(len(alignment_df)), y_values, s=14, alpha=0.7, color="#2ca02c")
         axes[1].set_xlabel("Chunk index")
-    axes[1].set_title("Valid Mod Coverage vs Base Accuracy")
-    axes[1].set_ylabel("Valid mod coverage")
+    if has_valid_mod_coverage:
+        axes[1].set_title("Valid Mod Coverage vs Base Accuracy")
+        axes[1].set_ylabel("Valid mod coverage")
+    else:
+        axes[1].set_title("Predicted-base Coverage vs Base Accuracy")
+        axes[1].set_ylabel("Predicted base coverage")
 
     fig.tight_layout()
     path = output_dir / "mod_alignment_coverage.png"
@@ -867,7 +917,7 @@ def main(args):
     if not supports_mod_eval:
         warnings.append(
             "Loaded model does not provide modification-head helpers (predict_mods/align_predictions_to_targets). "
-            "This run will report basecalling-only metrics, and modification metrics will be marked as unavailable."
+            "This run will still report sequence/reference alignment coverage metrics, but modification metrics will be marked as unavailable."
         )
     if getattr(model, "mod_loss_weight", 1.0) == 0:
         warnings.append("model.mod_loss_weight is 0. The modification branch is not contributing to total_loss.")
@@ -944,6 +994,12 @@ def main(args):
                         "reference": ref,
                         "prediction": seq,
                         "accuracy_pct": acc_pct,
+                    })
+                if not supports_mod_eval:
+                    mod_alignment_records.append({
+                        "chunk_index": global_chunk_index + local_idx,
+                        "sample_index_in_batch": local_idx,
+                        **build_base_alignment_record(ref, seq),
                     })
 
             if supports_mod_eval:
@@ -1041,17 +1097,24 @@ def main(args):
         }
     else:
         alignment_summary = {
-            "mean_target_coverage": float(alignment_df["target_coverage"].mean()),
-            "mean_predicted_base_coverage": float(alignment_df["predicted_base_coverage"].mean()),
-            "mean_valid_mod_coverage": float(alignment_df["valid_mod_coverage"].mean()),
-            "mean_predicted_base_len": float(alignment_df["predicted_base_len"].mean()),
-            "mean_target_len": float(alignment_df["target_len"].mean()),
+            "mean_target_coverage": float(pd.to_numeric(alignment_df["target_coverage"], errors="coerce").mean()),
+            "mean_predicted_base_coverage": float(pd.to_numeric(alignment_df["predicted_base_coverage"], errors="coerce").mean()),
+            "mean_valid_mod_coverage": float(pd.to_numeric(alignment_df["valid_mod_coverage"], errors="coerce").mean())
+            if pd.to_numeric(alignment_df["valid_mod_coverage"], errors="coerce").notna().any()
+            else 0.0,
+            "mean_predicted_base_len": float(pd.to_numeric(alignment_df["predicted_base_len"], errors="coerce").mean()),
+            "mean_target_len": float(pd.to_numeric(alignment_df["target_len"], errors="coerce").mean()),
         }
         if alignment_summary["mean_valid_mod_coverage"] < 0.5:
-            warnings.append(
-                "Per-base target-axis projection is covering fewer than half of valid modification sites on average. "
-                "This usually means base predictions and references are still too far apart for stable mod supervision."
-            )
+            if supports_mod_eval:
+                warnings.append(
+                    "Per-base target-axis projection is covering fewer than half of valid modification sites on average. "
+                    "This usually means base predictions and references are still too far apart for stable mod supervision."
+                )
+            else:
+                warnings.append(
+                    "valid_mod_coverage is unavailable for base-only models and is therefore reported as 0.0 in the summary."
+                )
 
     if supports_mod_eval:
         merged_projection = {
