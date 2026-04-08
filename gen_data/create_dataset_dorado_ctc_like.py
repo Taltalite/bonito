@@ -27,6 +27,7 @@ import gc
 import json
 import multiprocessing
 import os
+import shutil
 from collections import OrderedDict
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from dataclasses import dataclass
@@ -58,6 +59,8 @@ FLUSH_SAMPLE_COUNT = 5000
 DEFAULT_TASK_BATCH_SIZE = 8
 DEFAULT_MAX_PENDING_BATCHES = 2
 DEFAULT_MAX_SAMPLES_PER_WORKER_FILE = 512
+DEFAULT_PROGRESS_LOG_INTERVAL = 100
+MAX_OPEN_MERGE_CHUNKS = 32
 
 
 def typical_indices(x: np.ndarray, n: float = 2.5) -> np.ndarray:
@@ -208,6 +211,9 @@ def worker_init(
     use_parent_aligner: bool,
 ):
     os.environ["TMPDIR"] = "/tmp"
+    os.environ["TMP"] = "/tmp"
+    os.environ["TEMP"] = "/tmp"
+    tempfile.tempdir = "/tmp"
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
@@ -619,6 +625,41 @@ def find_chunk_index(starts: Sequence[int], index: int) -> int:
     return lo
 
 
+def close_memmap_array(array: np.ndarray) -> None:
+    mmap_obj = getattr(array, "_mmap", None)
+    if mmap_obj is not None:
+        mmap_obj.close()
+
+
+def close_chunk_arrays(chunk_arrays: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]) -> None:
+    for array in chunk_arrays:
+        close_memmap_array(array)
+
+
+def snapshot_hidden_temp_dirs(root: Path) -> set[str]:
+    if not root.is_dir():
+        return set()
+    return {
+        child.name
+        for child in root.iterdir()
+        if child.is_dir() and child.name.startswith(".tmp")
+    }
+
+
+def cleanup_new_hidden_temp_dirs(root: Path, existing_names: set[str]) -> int:
+    if not root.is_dir():
+        return 0
+    removed = 0
+    for child in root.iterdir():
+        if not child.is_dir() or not child.name.startswith(".tmp"):
+            continue
+        if child.name in existing_names:
+            continue
+        shutil.rmtree(child, ignore_errors=True)
+        removed += 1
+    return removed
+
+
 def merge_chunks_to_final(
     output_dir: Path,
     chunk_manifest: List[Dict[str, object]],
@@ -652,12 +693,16 @@ def merge_chunks_to_final(
     lens_out = np.lib.format.open_memmap(output_dir / "reference_lengths.npy", mode="w+", dtype=np.uint16, shape=(total_samples,))
 
     starts = build_chunk_ranges(chunk_manifest)
-    chunk_cache: Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    chunk_cache: OrderedDict[int, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = OrderedDict()
 
     def load_chunk_data(idx: int):
         if idx in chunk_cache:
+            chunk_cache.move_to_end(idx)
             return chunk_cache[idx]
         info = chunk_manifest[idx]
+        if len(chunk_cache) >= MAX_OPEN_MERGE_CHUNKS:
+            _, old_chunk = chunk_cache.popitem(last=False)
+            close_chunk_arrays(old_chunk)
         chunk_cache[idx] = (
             np.load(info["signals"], mmap_mode="r"),
             np.load(info["labels"], mmap_mode="r"),
@@ -686,6 +731,9 @@ def merge_chunks_to_final(
         lens_out[out_start:out_end] = block_lengths
 
     del chunks_out, refs_out, lens_out
+    for chunk_arrays in chunk_cache.values():
+        close_chunk_arrays(chunk_arrays)
+    chunk_cache.clear()
 
     for chunk_info in chunk_manifest:
         os.remove(chunk_info["signals"])
@@ -769,16 +817,22 @@ def parse_args():
     parser.add_argument("--task-batch-size", type=int, default=DEFAULT_TASK_BATCH_SIZE)
     parser.add_argument("--max-pending-batches", type=int, default=DEFAULT_MAX_PENDING_BATCHES)
     parser.add_argument("--max-samples-per-worker-file", type=int, default=DEFAULT_MAX_SAMPLES_PER_WORKER_FILE)
+    parser.add_argument("--progress-log-interval", type=int, default=DEFAULT_PROGRESS_LOG_INTERVAL, help="Print a step3 progress log whenever accepted chunks increase by this many. Set <=0 to disable.")
     parser.add_argument("--mp-start-method", choices=["auto", "fork", "spawn", "forkserver"], default="auto")
     return parser.parse_args()
 
 
 def main():
     os.environ["TMPDIR"] = "/tmp"
+    os.environ["TMP"] = "/tmp"
+    os.environ["TEMP"] = "/tmp"
+    tempfile.tempdir = "/tmp"
     args = parse_args()
     resolve_thresholds(args)
     np.random.seed(args.seed)
     start_method = resolve_mp_start_method(args.mp_start_method)
+    cwd = Path.cwd()
+    existing_hidden_tmp_dirs = snapshot_hidden_temp_dirs(cwd)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -815,6 +869,8 @@ def main():
     task_batch: List[TaskData] = []
     max_pending_batches = max(int(args.max_pending_batches), 1)
     max_chunks = int(args.max_chunks)
+    progress_log_interval = int(args.progress_log_interval)
+    next_progress_log = progress_log_interval if progress_log_interval > 0 else None
     mp_context = multiprocessing.get_context(start_method)
 
     global PARENT_POD5_LOOKUP
@@ -838,44 +894,64 @@ def main():
         with pysam.AlignmentFile(args.bam_file, "rb", check_sq=False) as bam_file:
             futures = set()
             stop_dispatch = False
-            for read in tqdm(bam_file, desc="Dispatching", unit="record", ascii=True, ncols=100):
-                if stop_dispatch:
-                    break
-                if args.max_records > 0 and task_count >= args.max_records:
-                    break
-                task = build_task(read, args)
-                if task is None:
-                    continue
-                if task.pod5_read_id not in lookup:
-                    continue
-                task_batch.append(task)
-                task_count += 1
+            with tqdm(bam_file, desc="Dispatching", unit="record", ascii=True, ncols=100) as dispatch_bar:
+                for read in dispatch_bar:
+                    if stop_dispatch:
+                        break
+                    if args.max_records > 0 and task_count >= args.max_records:
+                        break
+                    task = build_task(read, args)
+                    if task is None:
+                        continue
+                    if task.pod5_read_id not in lookup:
+                        continue
+                    task_batch.append(task)
+                    task_count += 1
 
-                if len(task_batch) >= max(int(args.task_batch_size), 1):
+                    if len(task_batch) >= max(int(args.task_batch_size), 1):
+                        futures.add(executor.submit(process_task_batch, tuple(task_batch), int(args.max_samples_per_worker_file)))
+                        task_batch = []
+
+                    if len(futures) >= max_pending_batches:
+                        done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                        futures.difference_update(done)
+                        for future in done:
+                            manifest_entries, stats = future.result()
+                            merge_counters(counters, stats)
+                            chunk_manifest.extend(manifest_entries)
+                            current_chunks = counters.get("chunks_written", 0)
+                            dispatch_bar.set_postfix_str(f"accepted_chunks={current_chunks}")
+                            if next_progress_log is not None and current_chunks >= next_progress_log:
+                                print(
+                                    f"      progress: accepted_chunks={current_chunks}, "
+                                    f"tasks_processed={counters.get('records_seen', 0)}, "
+                                    f"bam_records_dispatched={task_count}"
+                                )
+                                while next_progress_log is not None and current_chunks >= next_progress_log:
+                                    next_progress_log += progress_log_interval
+                            if max_chunks > 0 and current_chunks >= max_chunks:
+                                stop_dispatch = True
+                        if stop_dispatch:
+                            print(f"      reached max_chunks={max_chunks}; stopping new task dispatch and draining in-flight batches...")
+                            break
+
+                if task_batch and not stop_dispatch:
                     futures.add(executor.submit(process_task_batch, tuple(task_batch), int(args.max_samples_per_worker_file)))
                     task_batch = []
-
-                if len(futures) >= max_pending_batches:
-                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
-                    futures.difference_update(done)
-                    for future in done:
-                        manifest_entries, stats = future.result()
-                        merge_counters(counters, stats)
-                        chunk_manifest.extend(manifest_entries)
-                        if max_chunks > 0 and counters.get("chunks_written", 0) >= max_chunks:
-                            stop_dispatch = True
-                    if stop_dispatch:
-                        print(f"      reached max_chunks={max_chunks}; stopping new task dispatch and draining in-flight batches...")
-                        break
-
-            if task_batch and not stop_dispatch:
-                futures.add(executor.submit(process_task_batch, tuple(task_batch), int(args.max_samples_per_worker_file)))
-                task_batch = []
 
             for future in tqdm(as_completed(futures), total=len(futures), desc="Finishing", ascii=True, ncols=100):
                 manifest_entries, stats = future.result()
                 merge_counters(counters, stats)
                 chunk_manifest.extend(manifest_entries)
+                current_chunks = counters.get("chunks_written", 0)
+                if next_progress_log is not None and current_chunks >= next_progress_log:
+                    print(
+                        f"      progress: accepted_chunks={current_chunks}, "
+                        f"tasks_processed={counters.get('records_seen', 0)}, "
+                        f"bam_records_dispatched={task_count}"
+                    )
+                    while next_progress_log is not None and current_chunks >= next_progress_log:
+                        next_progress_log += progress_log_interval
         executor.shutdown(wait=True, cancel_futures=False)
     except KeyboardInterrupt:
         print("\n[interrupt] stopping workers and cancelling pending batches...", flush=True)
@@ -891,6 +967,9 @@ def main():
         PARENT_ALIGNER = None
         del lookup
         gc.collect()
+        removed_tmp_dirs = cleanup_new_hidden_temp_dirs(cwd, existing_hidden_tmp_dirs)
+        if removed_tmp_dirs:
+            print(f"      cleaned {removed_tmp_dirs} hidden temporary directories under {cwd}")
 
     print("[4/5] Merging passing chunks into final dataset...")
     merge_summary = merge_chunks_to_final(
@@ -909,6 +988,9 @@ def main():
         temp_dir.rmdir()
     except OSError:
         pass
+    removed_tmp_dirs = cleanup_new_hidden_temp_dirs(cwd, existing_hidden_tmp_dirs)
+    if removed_tmp_dirs:
+        print(f"      cleaned {removed_tmp_dirs} hidden temporary directories under {cwd}")
 
     print(f"Dataset ready at: {output_dir}")
     print(f"Final stats: {merge_summary['total_written']} chunks written.")
