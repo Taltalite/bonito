@@ -23,6 +23,7 @@ Reference:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import multiprocessing
 import os
@@ -196,9 +197,16 @@ class WorkerState:
 
 
 PARENT_POD5_LOOKUP: Dict[str, Tuple[str, int, int]] = {}
+PARENT_ALIGNER: Optional[mappy.Aligner] = None
 
 
-def worker_init(reference_fasta: str, pod5_lookup: Optional[Dict[str, Tuple[str, int, int]]], mm2_preset: str, temp_dir: str):
+def worker_init(
+    reference_fasta: str,
+    pod5_lookup: Optional[Dict[str, Tuple[str, int, int]]],
+    mm2_preset: str,
+    temp_dir: str,
+    use_parent_aligner: bool,
+):
     os.environ["TMPDIR"] = "/tmp"
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -206,7 +214,7 @@ def worker_init(reference_fasta: str, pod5_lookup: Optional[Dict[str, Tuple[str,
     os.environ["NUMEXPR_NUM_THREADS"] = "1"
     WorkerState.pod5_lookup = pod5_lookup if pod5_lookup is not None else PARENT_POD5_LOOKUP
     WorkerState.pod5_reader_cache = OrderedDict()
-    WorkerState.aligner = mappy.Aligner(reference_fasta, preset=mm2_preset)
+    WorkerState.aligner = PARENT_ALIGNER if use_parent_aligner else mappy.Aligner(reference_fasta, preset=mm2_preset)
     WorkerState.temp_dir = temp_dir
     if WorkerState.aligner is None:
         raise RuntimeError(f"Failed to build/load minimap2 index for {reference_fasta}")
@@ -247,16 +255,51 @@ def collect_pod5_paths(pod5_dir: Path) -> List[str]:
     return sorted(pod5_paths)
 
 
-def build_pod5_lookup(pod5_dir: Path) -> Dict[str, Tuple[str, int, int]]:
+def build_pod5_lookup(pod5_dir: Path, required_read_ids: Optional[set[str]] = None) -> Dict[str, Tuple[str, int, int]]:
     lookup: Dict[str, Tuple[str, int, int]] = {}
+    remaining = None if required_read_ids is None else set(required_read_ids)
     for pod5_path in tqdm(collect_pod5_paths(pod5_dir), desc="Indexing POD5", ascii=True, ncols=100):
         with pod5.Reader(pod5_path) as reader:
             for batch_idx in range(reader.batch_count):
                 batch = reader.get_batch(batch_idx)
                 for row_idx in range(batch.num_reads):
                     read = batch.get_read(row_idx)
-                    lookup[str(read.read_id)] = (pod5_path, batch_idx, row_idx)
+                    read_id = str(read.read_id)
+                    if remaining is not None and read_id not in remaining:
+                        continue
+                    lookup[read_id] = (pod5_path, batch_idx, row_idx)
+                    if remaining is not None:
+                        remaining.discard(read_id)
+                        if not remaining:
+                            return lookup
     return lookup
+
+
+def get_total_reads_from_index(bam_path: str) -> int:
+    try:
+        lines = pysam.idxstats(bam_path).splitlines()
+        return sum(int(line.split("\t")[2]) for line in lines)
+    except Exception:
+        return 0
+
+
+def collect_required_pod5_ids(bam_path: str, max_records: int) -> tuple[set[str], int]:
+    required: set[str] = set()
+    candidate_records = 0
+    total_est = get_total_reads_from_index(bam_path)
+    with pysam.AlignmentFile(bam_path, "rb", check_sq=False) as bam_file:
+        for read in tqdm(bam_file, total=total_est or None, desc="Scanning BAM", unit="record", ascii=True, ncols=100):
+            if max_records > 0 and candidate_records >= max_records:
+                break
+            if read.is_secondary or read.is_supplementary:
+                continue
+            if read.has_tag("dx") and int(read.get_tag("dx")) == 1:
+                continue
+            if not read.has_tag("mv") or not read.has_tag("ns"):
+                continue
+            candidate_records += 1
+            required.add(str(read.get_tag("pi")) if read.has_tag("pi") else str(read.query_name))
+    return required, candidate_records
 
 
 def fetch_calibrated_signal(read_id: str) -> np.ndarray:
@@ -468,7 +511,7 @@ def process_task(task: TaskData) -> Tuple[List[Sample], Dict[str, int]]:
     return samples, stats
 
 
-def merge_stats(total: Dict[str, int], update: Dict[str, int]) -> None:
+def merge_counters(total: Dict[str, int], update: Dict[str, int]) -> None:
     for key, value in update.items():
         total[key] = total.get(key, 0) + int(value)
 
@@ -513,7 +556,7 @@ def process_task_batch(tasks: Sequence[TaskData], max_samples_per_file: int) -> 
     manifest_entries: List[Dict[str, object]] = []
     for task in tasks:
         samples, stats = process_task(task)
-        merge_stats(batch_stats, stats)
+        merge_counters(batch_stats, stats)
         batch_samples.extend(samples)
         if len(batch_samples) >= max_samples_per_file:
             manifest_entry = write_worker_samples(batch_samples)
@@ -720,20 +763,36 @@ def main():
     args = parse_args()
     resolve_thresholds(args)
     np.random.seed(args.seed)
+    start_method = resolve_mp_start_method(args.mp_start_method)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     temp_dir = output_dir / "temp_chunks"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    print("[1/5] Building POD5 index...")
-    lookup = build_pod5_lookup(Path(args.pod5_dir))
-    print(f"      Found {len(lookup)} reads in POD5.")
-    start_method = resolve_mp_start_method(args.mp_start_method)
+    print("[1/5] Scanning BAM for required POD5 read ids...")
+    required_read_ids, candidate_records = collect_required_pod5_ids(args.bam_file, args.max_records)
+    print(f"      Candidate BAM records: {candidate_records}")
+    print(f"      Required POD5 parent/read ids: {len(required_read_ids)}")
+    print("[2/5] Building filtered POD5 index...")
+    lookup = build_pod5_lookup(Path(args.pod5_dir), required_read_ids=required_read_ids)
+    print(f"      Indexed {len(lookup)} reads in POD5.")
+    del required_read_ids
+    gc.collect()
     print(f"      multiprocessing start method: {start_method}")
 
+    global PARENT_ALIGNER
+    if start_method == "fork":
+        print("      preloading minimap2 index in parent for fork-shared workers...")
+        PARENT_ALIGNER = mappy.Aligner(args.reference_fasta, preset=args.mm2_preset)
+        if PARENT_ALIGNER is None:
+            raise RuntimeError(f"Failed to build/load minimap2 index for {args.reference_fasta}")
+    else:
+        PARENT_ALIGNER = None
+        print("      worker-local minimap2 indices enabled; this uses more memory than fork sharing.")
+
     effective_workers = max(1, min(int(args.workers), max((os.cpu_count() or 1) - 2, 1)))
-    print("[2/5] Dispatching BAM records...")
+    print("[3/5] Dispatching BAM records...")
     print(f"      requested workers: {args.workers}, effective workers: {effective_workers}")
     chunk_manifest: List[Dict[str, object]] = []
     counters: Dict[str, int] = {}
@@ -745,12 +804,19 @@ def main():
     global PARENT_POD5_LOOKUP
     PARENT_POD5_LOOKUP = lookup
     init_lookup = None if start_method == "fork" else lookup
+    use_parent_aligner = start_method == "fork"
 
     executor = ProcessPoolExecutor(
         max_workers=effective_workers,
         mp_context=mp_context,
         initializer=worker_init,
-        initargs=(str(Path(args.reference_fasta).resolve()), init_lookup, args.mm2_preset, str(temp_dir.resolve())),
+        initargs=(
+            str(Path(args.reference_fasta).resolve()),
+            init_lookup,
+            args.mm2_preset,
+            str(temp_dir.resolve()),
+            use_parent_aligner,
+        ),
     )
     try:
         with pysam.AlignmentFile(args.bam_file, "rb", check_sq=False) as bam_file:
@@ -760,6 +826,8 @@ def main():
                     break
                 task = build_task(read, args)
                 if task is None:
+                    continue
+                if task.pod5_read_id not in lookup:
                     continue
                 task_batch.append(task)
                 task_count += 1
@@ -773,7 +841,7 @@ def main():
                     futures.difference_update(done)
                     for future in done:
                         manifest_entries, stats = future.result()
-                        merge_stats(counters, stats)
+                        merge_counters(counters, stats)
                         chunk_manifest.extend(manifest_entries)
 
             if task_batch:
@@ -782,7 +850,7 @@ def main():
 
             for future in tqdm(as_completed(futures), total=len(futures), desc="Finishing", ascii=True, ncols=100):
                 manifest_entries, stats = future.result()
-                merge_stats(counters, stats)
+                merge_counters(counters, stats)
                 chunk_manifest.extend(manifest_entries)
         executor.shutdown(wait=True, cancel_futures=False)
     except KeyboardInterrupt:
@@ -796,21 +864,24 @@ def main():
         raise
     finally:
         PARENT_POD5_LOOKUP = {}
+        PARENT_ALIGNER = None
+        del lookup
+        gc.collect()
 
-    print("[3/5] Merging passing chunks into final dataset...")
-    merge_stats = merge_chunks_to_final(output_dir, chunk_manifest, int(args.chunk_len), args.max_label_len)
+    print("[4/5] Merging passing chunks into final dataset...")
+    merge_summary = merge_chunks_to_final(output_dir, chunk_manifest, int(args.chunk_len), args.max_label_len)
 
-    print("[4/5] Writing summary...")
-    write_summary(output_dir, args, counters, merge_stats)
+    print("[5/5] Writing summary...")
+    write_summary(output_dir, args, counters, merge_summary)
 
-    print("[5/5] Cleaning up temp chunks...")
+    print("[6/6] Cleaning up temp chunks...")
     try:
         temp_dir.rmdir()
     except OSError:
         pass
 
     print(f"Dataset ready at: {output_dir}")
-    print(f"Final stats: {merge_stats['total_written']} chunks written.")
+    print(f"Final stats: {merge_summary['total_written']} chunks written.")
     print("Reject counters:")
     for key in sorted(counters):
         print(f" - {key}: {counters[key]}")
