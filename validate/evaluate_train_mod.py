@@ -39,8 +39,10 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import MaxNLocator
 except ImportError:
     plt = None
+    MaxNLocator = None
 
 
 @dataclass
@@ -481,10 +483,37 @@ def save_base_plots(base_df: pd.DataFrame, output_dir: Path) -> List[str]:
     axes[0].set_xlabel("Accuracy (%)")
     axes[0].set_ylabel("Chunks")
 
-    axes[1].scatter(base_df["ref_len"], base_df["seq_len"], s=14, alpha=0.7, color="#ff7f0e")
+    ref_lengths = pd.to_numeric(base_df["ref_len"], errors="coerce")
+    seq_lengths = pd.to_numeric(base_df["seq_len"], errors="coerce")
+    axes[1].scatter(ref_lengths, seq_lengths, s=14, alpha=0.7, color="#ff7f0e")
     axes[1].set_title("Predicted Length vs Reference Length")
     axes[1].set_xlabel("Reference Length")
     axes[1].set_ylabel("Predicted Length")
+    joint_lengths = pd.concat([ref_lengths, seq_lengths], ignore_index=True).dropna()
+    if not joint_lengths.empty:
+        lower = max(0.0, float(joint_lengths.min()))
+        upper = float(joint_lengths.max())
+        span = max(upper - lower, 1.0)
+        pad = max(1.0, span * 0.03)
+        axis_min = max(0.0, lower - pad)
+        axis_max = upper + pad
+        axes[1].set_xlim(axis_min, axis_max)
+        axes[1].set_ylim(axis_min, axis_max)
+        axes[1].plot(
+            [axis_min, axis_max],
+            [axis_min, axis_max],
+            linestyle="--",
+            linewidth=1.1,
+            color="#6b7280",
+            alpha=0.9,
+        )
+    if MaxNLocator is not None:
+        locator = MaxNLocator(nbins=6)
+        axes[1].xaxis.set_major_locator(locator)
+        axes[1].yaxis.set_major_locator(locator)
+    axes[1].set_aspect("equal", adjustable="box")
+    if hasattr(axes[1], "set_box_aspect"):
+        axes[1].set_box_aspect(1)
 
     fig.tight_layout()
     path = output_dir / "base_eval.png"
