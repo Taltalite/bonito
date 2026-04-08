@@ -122,6 +122,79 @@ class TestMultiHeadModModel(unittest.TestCase):
         self.assertEqual(preds[0]["sites"][-1]["head_name"], "T/U slot")
         self.assertEqual(preds[0]["sites"][-1]["global_pred_label"], "canonical_T")
 
+    def test_decoding_is_cached_per_outputs_object(self):
+        model = MultiHeadModel(self._config())
+        outputs = model(torch.randn(1, 1, 16))
+        time_steps = outputs["base_scores"].shape[0]
+        path = torch.zeros((1, time_steps), dtype=torch.int16)
+        path[0, :4] = torch.tensor([1, 2, 3, 4], dtype=torch.int16)
+
+        targets = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+        lengths = torch.tensor([4], dtype=torch.int64)
+        mod_targets = torch.tensor([[4, 1, 2, 3]], dtype=torch.int64)
+
+        with mock.patch.object(model, "_decode_paths", return_value=path) as decode_paths:
+            decoded = model.decode_batch(outputs)
+            preds = model.predict_mods(outputs)
+            projection = model.align_predictions_to_targets(outputs, targets, lengths, mod_targets)
+
+        self.assertEqual(decoded, ["ACGT"])
+        self.assertEqual(preds[0]["sequence"], "ACGT")
+        self.assertEqual(projection["sample_records"][0]["aligned_equal_bases"], 4)
+        decode_paths.assert_called_once()
+
+    def test_standalone_alignment_cache_reuses_projection_across_outputs(self):
+        config = self._config()
+        config["training"] = {
+            "mode": "standalone_mod_head",
+            "pretrained_basecaller": "dummy",
+        }
+        model = MultiHeadModel(config)
+        outputs_1 = model(torch.randn(1, 1, 16), torch.tensor([7], dtype=torch.int64))
+        outputs_2 = model(torch.randn(1, 1, 16), torch.tensor([7], dtype=torch.int64))
+        time_steps = outputs_1["base_scores"].shape[0]
+        path = torch.zeros((1, time_steps), dtype=torch.int16)
+        path[0, :4] = torch.tensor([1, 2, 3, 4], dtype=torch.int16)
+
+        targets = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+        lengths = torch.tensor([4], dtype=torch.int64)
+        mod_targets = torch.tensor([[4, 1, 2, 3]], dtype=torch.int64)
+
+        with mock.patch.object(model, "_decode_paths", return_value=path) as decode_paths, \
+             mock.patch("bonito.transformer.multihead_model.edlib.align", return_value={"cigar": "4="}) as edlib_align:
+            losses_1 = model.loss(outputs_1, targets, lengths, mod_targets)
+            losses_2 = model.loss(outputs_2, targets, lengths, mod_targets)
+
+        decode_paths.assert_called_once()
+        edlib_align.assert_called_once()
+        self.assertTrue(torch.isfinite(losses_1["mod_loss"]))
+        self.assertTrue(torch.isfinite(losses_2["mod_loss"]))
+
+    def test_alignment_cache_is_bypassed_for_site_records(self):
+        config = self._config()
+        config["training"] = {
+            "mode": "standalone_mod_head",
+            "pretrained_basecaller": "dummy",
+        }
+        model = MultiHeadModel(config)
+        outputs_1 = model(torch.randn(1, 1, 16), torch.tensor([9], dtype=torch.int64))
+        outputs_2 = model(torch.randn(1, 1, 16), torch.tensor([9], dtype=torch.int64))
+        time_steps = outputs_1["base_scores"].shape[0]
+        path = torch.zeros((1, time_steps), dtype=torch.int16)
+        path[0, :4] = torch.tensor([1, 2, 3, 4], dtype=torch.int16)
+
+        targets = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+        lengths = torch.tensor([4], dtype=torch.int64)
+        mod_targets = torch.tensor([[4, 1, 2, 3]], dtype=torch.int64)
+
+        with mock.patch.object(model, "_decode_paths", return_value=path) as decode_paths, \
+             mock.patch("bonito.transformer.multihead_model.edlib.align", return_value={"cigar": "4="}) as edlib_align:
+            model.align_predictions_to_targets(outputs_1, targets, lengths, mod_targets, include_site_records=True)
+            model.align_predictions_to_targets(outputs_2, targets, lengths, mod_targets, include_site_records=True)
+
+        self.assertEqual(decode_paths.call_count, 2)
+        self.assertEqual(edlib_align.call_count, 2)
+
     def test_standalone_mode_freezes_basecaller_and_keeps_it_in_eval(self):
         config = self._config()
         config["training"] = {
@@ -172,10 +245,31 @@ class TestMultiHeadModModel(unittest.TestCase):
         mod_targets = torch.tensor([[4, 1, 2, 3]], dtype=torch.int64)
 
         with mock.patch.object(model, "_decode_paths", return_value=path), \
-             mock.patch.object(model.seqdist, "ctc_loss", return_value=torch.tensor(0.5)):
+             mock.patch.object(model.seqdist, "ctc_loss", return_value=torch.tensor(0.5)) as ctc_loss:
             losses = model.loss(outputs, targets, lengths, mod_targets)
 
+        ctc_loss.assert_not_called()
+        self.assertTrue(torch.equal(losses["loss"], torch.zeros_like(losses["loss"])))
+        self.assertTrue(torch.equal(losses["base_loss"], torch.zeros_like(losses["base_loss"])))
         self.assertTrue(torch.allclose(losses["total_loss"], losses["mod_loss"]))
+
+    def test_non_standalone_loss_still_computes_base_loss(self):
+        model = MultiHeadModel(self._config())
+        outputs = model(torch.randn(1, 1, 16))
+        time_steps = outputs["base_scores"].shape[0]
+        path = torch.zeros((1, time_steps), dtype=torch.int16)
+        path[0, :4] = torch.tensor([1, 2, 3, 4], dtype=torch.int16)
+
+        targets = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
+        lengths = torch.tensor([4], dtype=torch.int64)
+        mod_targets = torch.tensor([[4, 1, 2, 3]], dtype=torch.int64)
+
+        with mock.patch.object(model, "_decode_paths", return_value=path), \
+             mock.patch.object(model.seqdist, "ctc_loss", return_value=torch.tensor(0.5)) as ctc_loss:
+            losses = model.loss(outputs, targets, lengths, mod_targets)
+
+        ctc_loss.assert_called_once()
+        self.assertTrue(torch.allclose(losses["base_loss"], torch.tensor(0.5)))
 
     def test_standalone_load_model_reconstructs_frozen_basecaller(self):
         torch.manual_seed(7)

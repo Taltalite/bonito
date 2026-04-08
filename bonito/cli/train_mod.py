@@ -13,8 +13,12 @@ import toml
 import torch
 
 from bonito.training_mod import TrainerMod
-from bonito.data import load_mod_data, ModelSetup, ComputeSettings, DataSettings
-from bonito.util import STANDALONE_MOD_HEAD_MODE, default_config, load_pretrained_weights, load_symbol, init, resolve_model_dir
+from bonito.data import ModelSetup, ComputeSettings, DataSettings
+from bonito.train_mod_data import load_train_mod_data
+from bonito.util import STANDALONE_MOD_HEAD_MODE, load_pretrained_weights, load_symbol, init, resolve_model_dir
+
+
+train_mod_default_config = Path(__file__).resolve().parent.parent / "models/configs/multihead_transformer.toml"
 
 
 def load_pretrained_encoder_config(pretrained):
@@ -24,54 +28,6 @@ def load_pretrained_encoder_config(pretrained):
         raise FileNotFoundError(f"Pretrained config not found: {pretrain_file}")
     pretrained_config = toml.load(pretrain_file)
     return pretrained_config.get("model", {}).get("encoder")
-
-
-def freeze_parameters(module):
-    for param in module.parameters():
-        param.requires_grad = False
-
-
-def apply_freeze_settings(model, args):
-    frozen = []
-    if args.freeze_conv:
-        if hasattr(model, "conv"):
-            freeze_parameters(model.conv)
-            frozen.append("conv")
-        elif hasattr(model, "encoder") and hasattr(model.encoder, "conv"):
-            freeze_parameters(model.encoder.conv)
-            frozen.append("encoder.conv")
-
-    if args.freeze_base_head:
-        if hasattr(model, "crf"):
-            freeze_parameters(model.crf)
-            frozen.append("crf")
-        elif hasattr(model, "encoder") and hasattr(model.encoder, "crf"):
-            freeze_parameters(model.encoder.crf)
-            frozen.append("encoder.crf")
-        elif hasattr(model, "base_decoder"):
-            freeze_parameters(model.base_decoder)
-            frozen.append("base_decoder")
-
-    if args.freeze_encoder:
-        if hasattr(model, "encoder_layers"):
-            for layer in model.encoder_layers:
-                freeze_parameters(layer)
-            frozen.append("encoder_layers=all")
-        elif hasattr(model, "encoder") and hasattr(model.encoder, "transformer_encoder"):
-            freeze_parameters(model.encoder.transformer_encoder)
-            frozen.append("encoder.transformer_encoder=all")
-    elif args.freeze_encoder_layers > 0:
-        if hasattr(model, "encoder_layers"):
-            for layer in model.encoder_layers[:args.freeze_encoder_layers]:
-                freeze_parameters(layer)
-            frozen.append(f"encoder_layers=first_{args.freeze_encoder_layers}")
-        elif hasattr(model, "encoder") and hasattr(model.encoder, "transformer_encoder"):
-            for layer in list(model.encoder.transformer_encoder)[:args.freeze_encoder_layers]:
-                freeze_parameters(layer)
-            frozen.append(f"encoder.transformer_encoder=first_{args.freeze_encoder_layers}")
-
-    if frozen:
-        print(f"[freezing parameters] - {', '.join(frozen)}")
 
 
 def main(args):
@@ -86,40 +42,31 @@ def main(args):
 
     config = toml.load(args.config)
     config["__config_dir__"] = str(Path(args.config).resolve().parent)
-    standalone_mod_head = bool(args.pretrained and not args.joint_finetune)
-    training_mode = (
-        STANDALONE_MOD_HEAD_MODE
-        if standalone_mod_head
-        else ("joint_finetune" if args.pretrained else "scratch")
-    )
+    pretrained_encoder = config.get("model", {}).get("pretrained_encoder")
+    if pretrained_encoder is None:
+        pretrained_encoder = load_pretrained_encoder_config(args.pretrained)
+        if not pretrained_encoder:
+            raise ValueError(
+                "train_mod requires a pretrained basecaller with model.encoder in config.toml "
+                "so standalone mod-head training can reconstruct the frozen encoder."
+            )
+        config.setdefault("model", {})["pretrained_encoder"] = pretrained_encoder
+
     training_cfg = {
         **config.get("training", {}),
         **vars(args),
         "pwd": os.getcwd(),
-        "mode": training_mode,
+        "mode": STANDALONE_MOD_HEAD_MODE,
+        "pretrained": args.pretrained,
+        "pretrained_basecaller": args.pretrained,
+        "pretrained_basecaller_dir": resolve_model_dir(args.pretrained),
+        "mod_head_weights_pattern": "weights_{epoch}.tar",
     }
-    if args.pretrained:
-        training_cfg["pretrained"] = args.pretrained
-        training_cfg["pretrained_basecaller"] = args.pretrained
-        training_cfg["pretrained_basecaller_dir"] = resolve_model_dir(args.pretrained)
-        training_cfg["mod_head_weights_pattern"] = "weights_{epoch}.tar"
     config["training"] = training_cfg
-    if args.pretrained and "pretrained_encoder" not in config.get("model", {}):
-        pretrained_encoder = load_pretrained_encoder_config(args.pretrained)
-        if pretrained_encoder:
-            config.setdefault("model", {})["pretrained_encoder"] = pretrained_encoder
 
     print("[loading model]")
     model = load_symbol(config, 'Model')(config)
-    if args.pretrained:
-        preload_stats = load_pretrained_weights(model, args.pretrained, device)
-    else:
-        preload_stats = {}
-    if standalone_mod_head:
-        if args.freeze_conv or args.freeze_base_head or args.freeze_encoder or args.freeze_encoder_layers > 0:
-            print("[freeze settings ignored] standalone mod-head mode freezes the full pretrained basecaller automatically.")
-    else:
-        apply_freeze_settings(model, args)
+    preload_stats = load_pretrained_weights(model, args.pretrained, device)
 
     try:
         model = torch.compile(model)
@@ -144,7 +91,7 @@ def main(args):
         seed=args.seed,
     )
 
-    train_loader, valid_loader = load_mod_data(data, model_setup, compute_settings)
+    train_loader, valid_loader = load_train_mod_data(data, model_setup, compute_settings)
 
     try:
         dataset_cfg = train_loader.dataset.dataset_config
@@ -188,13 +135,8 @@ def argparser():
         add_help=False
     )
     parser.add_argument("training_directory")
-    parser.add_argument('--config', default=default_config)
-    parser.add_argument('--pretrained', default="")
-    parser.add_argument("--joint-finetune", action="store_true", default=False)
-    parser.add_argument("--freeze-conv", action="store_true", default=False)
-    parser.add_argument("--freeze-base-head", action="store_true", default=False)
-    parser.add_argument("--freeze-encoder", action="store_true", default=False)
-    parser.add_argument("--freeze-encoder-layers", type=int, default=0)
+    parser.add_argument('--config', default=str(train_mod_default_config))
+    parser.add_argument('--pretrained', required=True)
     parser.add_argument("--directory", type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--lr", default='2e-3')

@@ -36,6 +36,7 @@ DEFAULT_BASE_SLOT_ALIASES = {
 }
 IGNORE_INDEX = -100
 STANDALONE_MOD_HEAD_MODE = "standalone_mod_head"
+DEFAULT_ALIGNMENT_CACHE_CAPACITY = 262144
 
 
 class LightweightModBlock(torch.nn.Module):
@@ -176,6 +177,7 @@ class MultiHeadModel(torch.nn.Module):
             self.base_label_to_slot[base] = base
             for alias in aliases:
                 self.base_label_to_slot[alias] = base
+        self.head_name_to_id = {base: idx for idx, base in enumerate(self.mod_bases)}
 
         configured_head_defs = model_cfg.get("mod_head_defs", {})
         self.mod_head_defs = {}
@@ -216,6 +218,21 @@ class MultiHeadModel(torch.nn.Module):
             if canonical_id not in self.global_id_to_head_local:
                 raise ValueError(f"Canonical global label for base {base} is not assigned to head {base}")
 
+        token_to_head_id = torch.full((len(self.alphabet),), -1, dtype=torch.long)
+        for token_value in range(len(self.alphabet)):
+            head_name = self._base_slot_for_token(token_value)
+            if head_name is not None:
+                token_to_head_id[token_value] = self.head_name_to_id[head_name]
+        self.register_buffer("token_to_head_id", token_to_head_id, persistent=False)
+
+        global_target_to_head_id = torch.full((len(self.mod_global_labels),), -1, dtype=torch.long)
+        global_target_to_local_id = torch.full((len(self.mod_global_labels),), -1, dtype=torch.long)
+        for global_id, (head_name, local_idx) in self.global_id_to_head_local.items():
+            global_target_to_head_id[global_id] = self.head_name_to_id[head_name]
+            global_target_to_local_id[global_id] = int(local_idx)
+        self.register_buffer("global_target_to_head_id", global_target_to_head_id, persistent=False)
+        self.register_buffer("global_target_to_local_id", global_target_to_local_id, persistent=False)
+
         self.mod_trunk_dim = int(model_cfg.get("mod_trunk_dim", 128))
         self.mod_trunk_kernel_size = int(model_cfg.get("mod_trunk_kernel_size", 5))
         self.mod_trunk_depth = int(model_cfg.get("mod_trunk_depth", 1))
@@ -235,6 +252,11 @@ class MultiHeadModel(torch.nn.Module):
         self.config = config
         self.training_mode = str(config.get("training", {}).get("mode", "")).strip()
         self.standalone_mod_head = self.training_mode == STANDALONE_MOD_HEAD_MODE
+        self.alignment_cache_capacity = max(
+            int(config.get("training", {}).get("alignment_cache_capacity", DEFAULT_ALIGNMENT_CACHE_CAPACITY)),
+            0,
+        )
+        self._alignment_cache = OrderedDict()
         if self.standalone_mod_head:
             self._freeze_basecaller_parameters()
             self._set_basecaller_eval()
@@ -376,7 +398,11 @@ class MultiHeadModel(torch.nn.Module):
         scores = self.seqdist.posteriors(base_scores.detach().to(torch.float32)) + 1e-8
         return self.seqdist.viterbi(scores.log()).to(torch.int16).T
 
-    def _per_base_prediction_tensors(self, outputs) -> List[Dict[str, object]]:
+    def _decoded_base_predictions(self, outputs) -> List[Dict[str, object]]:
+        cached = outputs.get("_decoded_base_predictions")
+        if cached is not None:
+            return cached
+
         with torch.no_grad():
             paths = self._decode_paths(outputs["base_scores"])
 
@@ -389,7 +415,45 @@ class MultiHeadModel(torch.nn.Module):
                 "emit_tokens": emit_tokens,
                 "sequence": self._tokens_to_string(emit_tokens),
             })
+
+        outputs["_decoded_base_predictions"] = predictions
         return predictions
+
+    def _sample_keys(self, outputs):
+        cached = outputs.get("_sample_keys_cpu")
+        if cached is not None:
+            return cached
+
+        sample_keys = outputs.get("sample_keys")
+        if sample_keys is None:
+            return None
+        cached = tuple(int(value) for value in sample_keys.detach().to("cpu").tolist())
+        outputs["_sample_keys_cpu"] = cached
+        return cached
+
+    def _alignment_cache_enabled(self, outputs, mod_targets, include_site_records: bool) -> bool:
+        return (
+            self.standalone_mod_head
+            and mod_targets is not None
+            and not include_site_records
+            and self.alignment_cache_capacity > 0
+            and outputs.get("sample_keys") is not None
+        )
+
+    def _alignment_cache_get(self, sample_key: int):
+        entry = self._alignment_cache.get(sample_key)
+        if entry is None:
+            return None
+        self._alignment_cache.move_to_end(sample_key)
+        return entry
+
+    def _alignment_cache_put(self, sample_key: int, entry) -> None:
+        if self.alignment_cache_capacity <= 0:
+            return
+        self._alignment_cache[sample_key] = entry
+        self._alignment_cache.move_to_end(sample_key)
+        while len(self._alignment_cache) > self.alignment_cache_capacity:
+            self._alignment_cache.popitem(last=False)
 
     def _head_probabilities(self, head_name: str, logits: torch.Tensor) -> torch.Tensor:
         if logits.shape[-1] == 1:
@@ -465,7 +529,7 @@ class MultiHeadModel(torch.nn.Module):
                 raise ValueError(f"Unsupported CIGAR op from edlib: {op}")
         return pairs
 
-    def forward(self, x) -> Dict[str, torch.Tensor]:
+    def forward(self, x, *extra) -> Dict[str, torch.Tensor]:
         features, base_scores = self._encode_features_and_base_scores(x)
         mod_hidden = self.mod_input_proj(features)
         for block in self.mod_trunk:
@@ -474,20 +538,22 @@ class MultiHeadModel(torch.nn.Module):
             base: head(mod_hidden)
             for base, head in self.mod_heads.items()
         }
-        return {
+        outputs = {
             "base_scores": base_scores,
             "mod_features": mod_hidden,
             "mod_logits_by_base": mod_logits_by_base,
         }
+        if extra:
+            outputs["sample_keys"] = extra[0]
+        return outputs
 
     def decode_batch(self, outputs):
-        paths = self._decode_paths(outputs["base_scores"])
-        return [self.seqdist.path_to_str(path.cpu().numpy()) for path in paths]
+        return [sample["sequence"] for sample in self._decoded_base_predictions(outputs)]
 
     def predict_mods(self, outputs, mod_threshold: float = 0.5) -> List[Dict[str, object]]:
         predictions = []
         mod_logits_by_base = outputs["mod_logits_by_base"]
-        for sample_idx, sample in enumerate(self._per_base_prediction_tensors(outputs)):
+        for sample_idx, sample in enumerate(self._decoded_base_predictions(outputs)):
             emit_tokens = sample["emit_tokens"].detach().cpu().tolist()
             emit_positions = sample["emit_positions"].detach().cpu().tolist()
             site_predictions = []
@@ -535,34 +601,39 @@ class MultiHeadModel(torch.nn.Module):
         include_site_records: bool = False,
         site_record_limit: int | None = None,
     ) -> Dict[str, object]:
-        predictions = self._per_base_prediction_tensors(outputs)
         per_head_logits = {base: [] for base in self.mod_bases}
         per_head_targets = {base: [] for base in self.mod_bases}
         per_head_global_targets = {base: [] for base in self.mod_bases}
         sample_records: List[Dict[str, object]] = []
         site_records: List[Dict[str, object]] = []
         remaining_site_slots = None if site_record_limit is None else max(int(site_record_limit), 0)
+        cache_enabled = self._alignment_cache_enabled(outputs, mod_targets, include_site_records)
+        sample_keys = self._sample_keys(outputs) if cache_enabled else None
+        predictions = None
 
-        for sample_idx, sample in enumerate(predictions):
+        for sample_idx in range(target_lengths.shape[0]):
             target_len = int(target_lengths[sample_idx].item())
-            target_tokens = targets[sample_idx, :target_len].to(torch.long)
-            target_seq = self._tokens_to_string(target_tokens)
-            equal_pairs = self._equal_alignment_pairs(sample["sequence"], target_seq)
-
-            aligned_equal = len(equal_pairs)
-            pred_len = int(sample["emit_tokens"].shape[0])
-            valid_target_mod_sites = 0
-            aligned_valid_mod_sites = 0
-
-            if mod_targets is not None:
-                valid_target_mod_sites = int((mod_targets[sample_idx, :target_len] != IGNORE_INDEX).sum().item())
-
-            if equal_pairs:
-                sample_device = outputs["base_scores"].device
-                pred_indices = torch.tensor([query_idx for query_idx, _ in equal_pairs], device=sample_device, dtype=torch.long)
-                target_indices = torch.tensor([target_idx for _, target_idx in equal_pairs], device=targets.device, dtype=torch.long)
+            cached_entry = self._alignment_cache_get(sample_keys[sample_idx]) if sample_keys is not None else None
+            if cached_entry is None:
+                if predictions is None:
+                    predictions = self._decoded_base_predictions(outputs)
+                sample = predictions[sample_idx]
+                target_tokens = targets[sample_idx, :target_len].to(torch.long)
+                target_seq = self._tokens_to_string(target_tokens)
+                equal_pairs = self._equal_alignment_pairs(sample["sequence"], target_seq)
+                aligned_equal = len(equal_pairs)
+                pred_len = int(sample["emit_tokens"].shape[0])
+                valid_target_mod_sites = 0
+                aligned_valid_mod_sites = 0
+                cached_heads = {}
 
                 if mod_targets is not None:
+                    valid_target_mod_sites = int((mod_targets[sample_idx, :target_len] != IGNORE_INDEX).sum().item())
+
+                if equal_pairs and mod_targets is not None:
+                    sample_device = outputs["base_scores"].device
+                    pred_indices = torch.tensor([query_idx for query_idx, _ in equal_pairs], device=sample_device, dtype=torch.long)
+                    target_indices = torch.tensor([target_idx for _, target_idx in equal_pairs], device=targets.device, dtype=torch.long)
                     matched_mod_targets = mod_targets[sample_idx, :target_len].index_select(0, target_indices)
                     matched_target_tokens = target_tokens.index_select(0, target_indices)
                     valid_mask = matched_mod_targets != IGNORE_INDEX
@@ -571,51 +642,32 @@ class MultiHeadModel(torch.nn.Module):
                         valid_pred_indices = pred_indices[valid_mask]
                         valid_target_indices = target_indices[valid_mask]
                         valid_targets = matched_mod_targets[valid_mask].to(torch.long)
-                        valid_target_tokens = matched_target_tokens[valid_mask]
+                        valid_target_tokens = matched_target_tokens[valid_mask].to(torch.long)
+                        valid_time_indices = sample["emit_positions"].to(sample_device).index_select(0, valid_pred_indices)
+                        valid_head_ids = self.token_to_head_id.index_select(0, valid_target_tokens)
+                        valid_target_head_ids = self.global_target_to_head_id.index_select(0, valid_targets)
+                        valid_local_targets = self.global_target_to_local_id.index_select(0, valid_targets)
 
-                        for head_name in self.mod_bases:
-                            slot_mask_values = [
-                                self._base_slot_for_token(int(token_value.item())) == head_name
-                                for token_value in valid_target_tokens
-                            ]
-                            if not any(slot_mask_values):
+                        for head_name, head_id in self.head_name_to_id.items():
+                            keep_mask = (valid_head_ids == head_id) & (valid_target_head_ids == head_id)
+                            if not bool(keep_mask.any()):
                                 continue
 
-                            slot_mask = torch.tensor(slot_mask_values, device=valid_targets.device, dtype=torch.bool)
-                            slot_pred_indices = valid_pred_indices[slot_mask]
-                            slot_target_indices = valid_target_indices[slot_mask]
-                            slot_global_targets = valid_targets[slot_mask]
-                            slot_time_indices = sample["emit_positions"].to(slot_pred_indices.device).index_select(0, slot_pred_indices)
-                            slot_logits_all = outputs["mod_logits_by_base"][head_name][sample_idx].to(torch.float32)
-
-                            local_target_values = []
-                            keep_mask_values = []
-                            for global_target in slot_global_targets.detach().cpu().tolist():
-                                head_mapping = self._global_to_local(global_target)
-                                if head_mapping is None or head_mapping[0] != head_name:
-                                    keep_mask_values.append(False)
-                                    continue
-                                keep_mask_values.append(True)
-                                local_target_values.append(head_mapping[1])
-
-                            if not any(keep_mask_values):
-                                continue
-
-                            keep_mask = torch.tensor(keep_mask_values, device=slot_global_targets.device, dtype=torch.bool)
-                            selected_pred_indices = slot_pred_indices[keep_mask]
-                            selected_target_indices = slot_target_indices[keep_mask]
-                            selected_time_indices = slot_time_indices[keep_mask]
-                            selected_logits = slot_logits_all.index_select(0, selected_time_indices)
-                            selected_global_targets = slot_global_targets[keep_mask]
-                            selected_local_targets = torch.tensor(
-                                local_target_values,
-                                device=slot_global_targets.device,
-                                dtype=torch.long,
-                            )
+                            selected_pred_indices = valid_pred_indices[keep_mask]
+                            selected_target_indices = valid_target_indices[keep_mask]
+                            selected_time_indices = valid_time_indices[keep_mask]
+                            selected_global_targets = valid_targets[keep_mask]
+                            selected_local_targets = valid_local_targets[keep_mask]
+                            selected_logits = outputs["mod_logits_by_base"][head_name][sample_idx].to(torch.float32).index_select(0, selected_time_indices)
 
                             per_head_logits[head_name].append(selected_logits)
                             per_head_targets[head_name].append(selected_local_targets)
                             per_head_global_targets[head_name].append(selected_global_targets)
+                            cached_heads[head_name] = {
+                                "time_indices": selected_time_indices.detach().to("cpu"),
+                                "local_targets": selected_local_targets.detach().to("cpu"),
+                                "global_targets": selected_global_targets.detach().to("cpu"),
+                            }
 
                             if include_site_records and (remaining_site_slots is None or remaining_site_slots > 0):
                                 probs = self._head_probabilities(head_name, selected_logits)
@@ -653,19 +705,41 @@ class MultiHeadModel(torch.nn.Module):
                                         if remaining_site_slots == 0:
                                             break
 
-            sample_records.append({
-                "sample_index_in_batch": sample_idx,
-                "predicted_base_len": pred_len,
-                "target_len": target_len,
-                "aligned_equal_bases": aligned_equal,
-                "target_coverage": float(aligned_equal / target_len) if target_len else 0.0,
-                "predicted_base_coverage": float(aligned_equal / pred_len) if pred_len else 0.0,
-                "valid_target_mod_sites": valid_target_mod_sites,
-                "aligned_valid_mod_sites": aligned_valid_mod_sites,
-                "valid_mod_coverage": float(aligned_valid_mod_sites / valid_target_mod_sites) if valid_target_mod_sites else 0.0,
-                "pred_sequence_prefix": sample["sequence"][:80],
-                "target_sequence_prefix": target_seq[:80],
-            })
+                sample_record = {
+                    "sample_index_in_batch": sample_idx,
+                    "predicted_base_len": pred_len,
+                    "target_len": target_len,
+                    "aligned_equal_bases": aligned_equal,
+                    "target_coverage": float(aligned_equal / target_len) if target_len else 0.0,
+                    "predicted_base_coverage": float(aligned_equal / pred_len) if pred_len else 0.0,
+                    "valid_target_mod_sites": valid_target_mod_sites,
+                    "aligned_valid_mod_sites": aligned_valid_mod_sites,
+                    "valid_mod_coverage": float(aligned_valid_mod_sites / valid_target_mod_sites) if valid_target_mod_sites else 0.0,
+                    "pred_sequence_prefix": sample["sequence"][:80],
+                    "target_sequence_prefix": target_seq[:80],
+                }
+                cached_entry = {
+                    "per_head": cached_heads,
+                    "sample_record": {k: v for k, v in sample_record.items() if k != "sample_index_in_batch"},
+                }
+                if sample_keys is not None:
+                    self._alignment_cache_put(sample_keys[sample_idx], cached_entry)
+            else:
+                sample_record = {
+                    "sample_index_in_batch": sample_idx,
+                    **cached_entry["sample_record"],
+                }
+                sample_device = outputs["base_scores"].device
+                for head_name, head_cache in cached_entry["per_head"].items():
+                    time_indices = head_cache["time_indices"].to(sample_device)
+                    local_targets = head_cache["local_targets"].to(sample_device)
+                    global_targets = head_cache["global_targets"].to(sample_device)
+                    selected_logits = outputs["mod_logits_by_base"][head_name][sample_idx].to(torch.float32).index_select(0, time_indices)
+                    per_head_logits[head_name].append(selected_logits)
+                    per_head_targets[head_name].append(local_targets)
+                    per_head_global_targets[head_name].append(global_targets)
+
+            sample_records.append(sample_record)
 
         head_projections = self._empty_head_projection(outputs)
         for head_name in self.mod_bases:
@@ -682,7 +756,10 @@ class MultiHeadModel(torch.nn.Module):
 
     def loss(self, outputs, targets, target_lengths, mod_targets):
         base_scores = outputs["base_scores"]
-        base_loss = self.seqdist.ctc_loss(base_scores.to(torch.float32), targets, target_lengths)
+        if self.standalone_mod_head:
+            base_loss = base_scores.new_zeros((), dtype=torch.float32)
+        else:
+            base_loss = self.seqdist.ctc_loss(base_scores.to(torch.float32), targets, target_lengths)
 
         projection = self.align_predictions_to_targets(outputs, targets, target_lengths, mod_targets)
         weighted_mod_loss = base_scores.new_zeros((), dtype=torch.float32)

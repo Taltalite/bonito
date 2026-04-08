@@ -1,6 +1,6 @@
 # `bonito train_mod`
 
-This command trains a shared-encoder multi-head model that predicts:
+This command trains a standalone shared-encoder multi-head model that predicts:
 
 - a basecalled sequence from `base_logits`
 - base-aligned modification labels from a shared modification trunk plus
@@ -203,10 +203,17 @@ per-head local targets after aligning predicted bases back to the reference.
 
 ## Training Command
 
+`train_mod` now supports exactly one workflow:
+
+- `--pretrained` is required
+- the pretrained basecaller is frozen
+- only the modification branch is trainable
+
 ```bash
 bonito train_mod runs/multihead_r9 \
   --directory /path/to/train_data \
   --config bonito/models/configs/multihead_transformer.toml \
+  --pretrained dna_r10.4.1@v5.0 \
   --epochs 30 \
   --chunks 100000 \
   --valid-chunks 10000 \
@@ -214,35 +221,17 @@ bonito train_mod runs/multihead_r9 \
   --device cuda
 ```
 
-Optional warm start from a pretrained basecaller:
-
-```bash
-bonito train_mod runs/multihead_r9 \
-  --directory /path/to/train_data \
-  --config bonito/models/configs/multihead_transformer.toml \
-  --pretrained dna_r10.4.1@v5.0 \
-```
-
-With `--pretrained`, `train_mod` now defaults to **standalone mod-head training**:
+`train_mod` always runs in **standalone mod-head training** mode:
 
 - the pretrained basecaller is treated as immutable
 - only the modification branch is trainable
 - checkpoints store the modification branch weights only
 - loading the run later reconstructs the model by combining the recorded pretrained basecaller with the saved mod-head weights
+- base decode results are cached per forward output and reused by loss/projection/prediction helpers
+- standalone training reuses per-sample alignment/projection results when stable sample keys are available from the built-in numpy loader
+- standalone training skips base-loss computation because the frozen basecaller is not optimized
 
 This is the recommended mode when you want to benchmark modification detection against the unchanged official basecaller output.
-
-To keep the legacy joint-finetuning behavior instead, opt out explicitly:
-
-```bash
-bonito train_mod runs/multihead_r9 \
-  --directory /path/to/train_data \
-  --config bonito/models/configs/multihead_transformer.toml \
-  --pretrained dna_r10.4.1@v5.0 \
-  --joint-finetune \
-  --freeze-conv \
-  --freeze-encoder-layers 2
-```
 
 ## Outputs
 
