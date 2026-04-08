@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import json
 import multiprocessing
 import os
 import time
@@ -197,16 +198,35 @@ def fetch_calibrated_signal(read_id):
         raise ValueError(f"Empty calibrated signal for read {read_id}")
     return pa_signal, pod5_read
 
+
 def process_task(task: TaskData) -> Tuple[List[Sample], Dict[str, int]]:
-    stats = {"valid_samples": 0, "rejected_low_acc": 0, "rejected_softclip": 0}
+    stats = {
+        "records_seen": 1,
+        "records_missing_signal": 0,
+        "records_signal_too_short": 0,
+        "records_missing_reference": 0,
+        "records_invalid_move_table": 0,
+        "records_low_accuracy_prefilter": 0,
+        "chunks_seen": 0,
+        "chunks_written": 0,
+        "chunks_zerolen_sequence": 0,
+        "chunks_softclip_or_insertion": 0,
+        "chunks_low_accuracy": 0,
+        "chunks_too_short": 0,
+        "chunks_too_long": 0,
+    }
     samples: List[Sample] = []
     
     if task.read_length <= 0: return samples, stats
 
     # 1. Fetch Signal
     try: pa_signal, _ = fetch_calibrated_signal(task.read_id)
-    except: return samples, stats
-    if pa_signal.shape[0] < task.signal_len_arg: return samples, stats
+    except:
+        stats["records_missing_signal"] += 1
+        return samples, stats
+    if pa_signal.shape[0] < task.signal_len_arg:
+        stats["records_signal_too_short"] += 1
+        return samples, stats
 
     # 2. Norm
     global_shift, global_scale = compute_norm_params(pa_signal, task.norm_strategy, task.pa_mean, task.pa_std)
@@ -218,7 +238,9 @@ def process_task(task: TaskData) -> Tuple[List[Sample], Dict[str, int]]:
     full_labels = np.zeros(task.read_length, dtype=np.uint8)
     
     reference_name = WorkerState.reference_mapping.get(task.reference_name)
-    if not reference_name: return samples, stats
+    if not reference_name:
+        stats["records_missing_reference"] += 1
+        return samples, stats
     fasta = WorkerState.fasta
     
     for q_pos, r_pos in task.aligned_pairs:
@@ -258,14 +280,15 @@ def process_task(task: TaskData) -> Tuple[List[Sample], Dict[str, int]]:
     if task.nm_tag is not None:
         approx_identity = 1.0 - (task.nm_tag / task.read_length)
         if approx_identity < 0.90: 
-            stats['rejected_low_acc'] += 1
+            stats['records_low_accuracy_prefilter'] += 1
 
     # 5. Map Signal to Bases
     mv = np.asarray(task.mv_tag, dtype=np.int64)
-    if mv.size <= 1: return samples, stats
+    if mv.size <= 1:
+        stats["records_invalid_move_table"] += 1
+        return samples, stats
     stride = int(mv[0])
     moves = mv[1:]
-    base_indices = np.flatnonzero(moves)
     ts_offset = int(task.ts_tag) if task.ts_tag is not None else 0
     base_pos_arr = ts_offset + (np.arange(len(moves)) * stride) + (stride // 2)
     base_pos_arr = base_pos_arr[moves == 1]
@@ -280,29 +303,36 @@ def process_task(task: TaskData) -> Tuple[List[Sample], Dict[str, int]]:
     _, offset_start = divmod(signal_len - chunk_len, chunk_stride)
     
     for win_start in range(offset_start, signal_len - chunk_len + 1, chunk_stride):
+        stats["chunks_seen"] += 1
         win_end = win_start + chunk_len
         left_idx = np.searchsorted(base_pos_arr, win_start, side="left")
         right_idx = np.searchsorted(base_pos_arr, win_end, side="left")
         
-        if left_idx >= right_idx: continue
+        if left_idx >= right_idx:
+            stats["chunks_zerolen_sequence"] += 1
+            continue
         if right_idx > len(full_labels): right_idx = len(full_labels)
         
         label_seq = full_labels[left_idx:right_idx]
 
         # 7. Strict Filter
         if np.any(label_seq == 0): # Rejects SoftClips & Insertions
-            stats['rejected_softclip'] += 1
+            stats['chunks_softclip_or_insertion'] += 1
             continue
         
         # Local Acc Check
         if task.nm_tag is not None:
              approx_identity = 1.0 - (task.nm_tag / task.read_length)
              if approx_identity < 0.85:
-                 stats['rejected_low_acc'] += 1
+                 stats['chunks_low_accuracy'] += 1
                  continue
 
-        if label_seq.size < 5: continue
-        if task.max_label_len is not None and label_seq.size > task.max_label_len: continue
+        if label_seq.size < 5:
+            stats["chunks_too_short"] += 1
+            continue
+        if task.max_label_len is not None and label_seq.size > task.max_label_len:
+            stats["chunks_too_long"] += 1
+            continue
 
         signal_window = pa_signal[win_start:win_end]
         normalized_signal = (signal_window - global_shift) / global_scale
@@ -313,7 +343,7 @@ def process_task(task: TaskData) -> Tuple[List[Sample], Dict[str, int]]:
             label=label_seq.astype(np.uint8),
             label_len=int(label_seq.size)
         ))
-        stats["valid_samples"] += 1
+        stats["chunks_written"] += 1
 
     return samples, stats
 
@@ -359,8 +389,13 @@ def build_chunk_ranges(chunk_manifest):
 def find_chunk_index(starts, index):
     return bisect.bisect_right(starts, index) - 1
 
+def merge_counters(total, update):
+    for key, value in update.items():
+        total[key] = total.get(key, 0) + int(value)
+
 def merge_chunks_to_final(output_dir, chunk_manifest, signal_len, max_label_len):
-    if not chunk_manifest: return
+    if not chunk_manifest:
+        return None
     lengths_list = []
     for chunk_info in tqdm(chunk_manifest, desc="Loading lengths"):
         lengths_list.append(np.load(chunk_info["lengths"]))
@@ -368,7 +403,7 @@ def merge_chunks_to_final(output_dir, chunk_manifest, signal_len, max_label_len)
     indices = typical_indices(lengths)
     if indices.size == 0:
         print("No samples remained.")
-        return
+        return None
     if max_label_len is None:
         max_label_len = int(lengths[indices].max())
     indices = np.random.permutation(indices)
@@ -412,6 +447,35 @@ def merge_chunks_to_final(output_dir, chunk_manifest, signal_len, max_label_len)
         os.remove(chunk_info["lengths"])
     print(f"Dataset ready at: {output_dir}")
     print(f"Final stats: {total_samples} chunks.")
+    return {
+        "total_pre_typical_filter": int(lengths.shape[0]),
+        "total_post_typical_filter": int(indices.size),
+        "total_written": int(total_samples),
+        "max_label_len": int(max_label_len),
+    }
+
+def write_summary(output_dir, args, counters, merge_stats):
+    chunk_accept_rate = None
+    if counters.get("chunks_seen", 0) > 0:
+        chunk_accept_rate = counters.get("chunks_written", 0) / counters["chunks_seen"]
+    summary = {
+        "bam_file": os.path.abspath(args.bam_file),
+        "pod5_dir": os.path.abspath(args.pod5_dir),
+        "reference_fasta": os.path.abspath(args.reference_fasta),
+        "output_dir": os.path.abspath(args.output_dir),
+        "sample_type": args.sample_type,
+        "chunk_len": int(args.chunk_len),
+        "overlap": int(args.overlap),
+        "stride": int(args.stride) if args.stride is not None else int(args.chunk_len - args.overlap),
+        "max_chunks": None if int(args.max_chunks) <= 0 else int(args.max_chunks),
+        "norm_strategy": args.norm_strategy,
+        "clip_value": float(args.clip_value),
+        "accepted_rate_step3": chunk_accept_rate,
+        "counters": {key: int(value) for key, value in sorted(counters.items())},
+        "merge": merge_stats,
+    }
+    with open(os.path.join(output_dir, "dataset_summary.json"), "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
 
 def get_total_reads_from_index(bam_path):
     try:
@@ -459,11 +523,12 @@ def main():
     chunk_manifest = []
     chunk_buffer = []
     chunk_id = 0
-    total_valid_samples = 0
+    total_written_chunks = 0
+    counters = {}
     with ProcessPoolExecutor(max_workers=args.workers, initializer=worker_init, initargs=(args.reference_fasta, lookup, reference_mapping)) as executor:
         futures = set()
         for read in tqdm(bam_file, total=total_est, unit="read", desc="Dispatching"):
-            if args.max_chunks > 0 and total_valid_samples >= args.max_chunks: break
+            if args.max_chunks > 0 and total_written_chunks >= args.max_chunks: break
             if read.is_unmapped or not read.has_tag("mv") or read.query_name not in lookup: continue
             
             # aligned_pairs
@@ -486,22 +551,32 @@ def main():
                 futures.difference_update(done)
                 for f in done:
                     s, stats = f.result()
+                    merge_counters(counters, stats)
                     chunk_buffer.extend(s)
-                    total_valid_samples += stats["valid_samples"]
+                    total_written_chunks += stats["chunks_written"]
                 if len(chunk_buffer) >= 5000:
                     chunk_id = flush_temp_chunk(chunk_id, chunk_buffer, temp_dir, chunk_manifest)
                     chunk_buffer = []
         for f in tqdm(as_completed(futures), total=len(futures), desc="Finishing"):
             s, stats = f.result()
+            merge_counters(counters, stats)
             chunk_buffer.extend(s)
-            total_valid_samples += stats["valid_samples"]
+            total_written_chunks += stats["chunks_written"]
             if len(chunk_buffer) >= 5000:
                 chunk_id = flush_temp_chunk(chunk_id, chunk_buffer, temp_dir, chunk_manifest)
                 chunk_buffer = []
     if chunk_buffer:
         chunk_id = flush_temp_chunk(chunk_id, chunk_buffer, temp_dir, chunk_manifest)
     print("[4/5] Merging...")
-    merge_chunks_to_final(args.output_dir, chunk_manifest, args.chunk_len, args.max_label_len)
+    merge_stats = merge_chunks_to_final(args.output_dir, chunk_manifest, args.chunk_len, args.max_label_len)
+    if merge_stats is not None:
+        write_summary(args.output_dir, args, counters, merge_stats)
+    print("Reject counters:")
+    for key in sorted(counters):
+        print(f" - {key}: {counters[key]}")
+    if counters.get("chunks_seen", 0) > 0:
+        accepted_rate = counters.get("chunks_written", 0) / counters["chunks_seen"]
+        print(f"accepted_rate_step3: {accepted_rate:.4%}")
     try: shutil.rmtree(temp_dir)
     except: pass
 
