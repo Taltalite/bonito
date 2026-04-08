@@ -93,7 +93,7 @@ class TrainerMod:
         self, model, device, train_loader, valid_loader, criterion=None,
         use_amp=True, lr_scheduler_fn=None, restore_optim=False,
         save_optim_every=10, grad_accum_split=1, quantile_grad_clip=False,
-        chunks_per_epoch=None, batch_size=None,
+        chunks_per_epoch=None, batch_size=None, profile_flush_chunks=10000,
     ):
         self.model = model.to(device)
         self.device = device
@@ -115,6 +115,75 @@ class TrainerMod:
         self.batch_size = batch_size
         self.chunks_per_epoch = chunks_per_epoch
         self.steps_per_epoch = chunks_per_epoch // batch_size
+        self.profile_flush_chunks = max(int(profile_flush_chunks), 0)
+
+    def _unwrap_model(self):
+        if hasattr(self.model, "module"):
+            return self.model.module
+        if hasattr(self.model, "_orig_mod"):
+            return self.model._orig_mod
+        return self.model
+
+    def _alignment_cache_stats(self):
+        model = self._unwrap_model()
+        if hasattr(model, "alignment_cache_stats"):
+            return model.alignment_cache_stats()
+        return None
+
+    def _reset_alignment_cache_stats(self):
+        model = self._unwrap_model()
+        if hasattr(model, "reset_alignment_cache_stats"):
+            model.reset_alignment_cache_stats()
+
+    def _sync_device(self):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    @staticmethod
+    def _new_profile_window():
+        return {
+            "chunks": 0,
+            "steps": 0,
+            "loader_wait": 0.0,
+            "device_transfer": 0.0,
+            "forward": 0.0,
+            "criterion": 0.0,
+            "backward": 0.0,
+            "optimizer": 0.0,
+            "wall": 0.0,
+        }
+
+    def _flush_profile_window(self, window, cache_stats, chunks_completed):
+        if window["steps"] == 0:
+            return
+
+        cache_hits = 0
+        cache_misses = 0
+        cache_lookups = 0
+        cache_hit_rate = 0.0
+        cache_size = 0
+        cache_capacity = 0
+        if cache_stats is not None:
+            cache_hits = int(cache_stats["hits"])
+            cache_misses = int(cache_stats["misses"])
+            cache_lookups = int(cache_stats["lookups"])
+            cache_hit_rate = float(cache_stats["hit_rate"])
+            cache_size = int(cache_stats["size"])
+            cache_capacity = int(cache_stats["capacity"])
+
+        step_ms = (window["wall"] / window["steps"]) * 1000.0
+        chunk_rate = (window["chunks"] / window["wall"]) if window["wall"] > 0 else 0.0
+        print(
+            "[profile train_mod] "
+            f"chunks={chunks_completed}/{self.chunks_per_epoch} "
+            f"window_chunks={window['chunks']} steps={window['steps']} "
+            f"step_ms={step_ms:.1f} chunks_per_s={chunk_rate:.1f} "
+            f"loader={window['loader_wait']:.2f}s transfer={window['device_transfer']:.2f}s "
+            f"forward={window['forward']:.2f}s criterion={window['criterion']:.2f}s "
+            f"backward={window['backward']:.2f}s optim={window['optimizer']:.2f}s "
+            f"cache_hit_rate={cache_hit_rate:.1%} hits={cache_hits} misses={cache_misses} "
+            f"lookups={cache_lookups} cache_size={cache_size}/{cache_capacity}"
+        )
 
     def _trainable_parameters(self):
         if hasattr(self.model, "trainable_parameters"):
@@ -123,24 +192,51 @@ class TrainerMod:
             params = [param for param in self.model.parameters() if param.requires_grad]
         return params
 
-    def train_one_step(self, batch):
-        self.optimizer.zero_grad()
+    def train_one_step(self, batch, profile_enabled: bool = False):
+        step_t0 = perf_counter()
+        self.optimizer.zero_grad(set_to_none=True)
         losses = None
+        timings = {
+            "device_transfer": 0.0,
+            "forward": 0.0,
+            "criterion": 0.0,
+            "backward": 0.0,
+            "optimizer": 0.0,
+            "wall": 0.0,
+        }
 
         for batch_ in zip(
             *map(lambda t: t.chunk(self.grad_accum_split, dim=0), batch)
         ):
+            transfer_t0 = perf_counter()
             data_, targets_, lengths_, mod_targets_, *args = (x.to(self.device) for x in batch_)
+            if profile_enabled:
+                self._sync_device()
+                timings["device_transfer"] += perf_counter() - transfer_t0
 
+            forward_t0 = perf_counter()
             with amp.autocast("cuda", enabled=self.use_amp):
                 outputs_ = self.model(data_, *args)
+            if profile_enabled:
+                self._sync_device()
+                timings["forward"] += perf_counter() - forward_t0
+
+            criterion_t0 = perf_counter()
+            with amp.autocast("cuda", enabled=self.use_amp):
                 losses_ = self.criterion(outputs_, targets_, lengths_, mod_targets_)
+            if profile_enabled:
+                self._sync_device()
+                timings["criterion"] += perf_counter() - criterion_t0
 
             if not isinstance(losses_, dict):
                 losses_ = {'loss': losses_}
 
             total_loss = losses_.get('total_loss', losses_['loss']) / self.grad_accum_split
+            backward_t0 = perf_counter()
             self.scaler.scale(total_loss).backward()
+            if profile_enabled:
+                self._sync_device()
+                timings["backward"] += perf_counter() - backward_t0
 
             losses = {
                 k: ((v.item() / self.grad_accum_split) if losses is None else (v.item() / self.grad_accum_split) + losses[k])
@@ -148,17 +244,23 @@ class TrainerMod:
             }
 
         scale = self.scaler.get_scale()
+        optim_t0 = perf_counter()
         self.scaler.unscale_(self.optimizer)
         grad_norm = self.clip_grad(self._trainable_parameters())
         self.scaler.step(self.optimizer)
         self.scaler.update()
+        if profile_enabled:
+            self._sync_device()
+            timings["optimizer"] += perf_counter() - optim_t0
+            timings["wall"] = perf_counter() - step_t0
 
-        return losses, grad_norm, scale
+        return losses, grad_norm, scale, timings
 
     def train_one_epoch(self, loss_log, lr_scheduler):
         t0 = perf_counter()
         chunks = 0
         self.model.train()
+        self._reset_alignment_cache_stats()
 
         progress_bar = tqdm(
             total=self.steps_per_epoch, desc='[0/{}]'.format(self.chunks_per_epoch),
@@ -166,12 +268,22 @@ class TrainerMod:
             **tqdm_environ()
         )
         smoothed_losses = None
+        profile_window = self._new_profile_window()
+        profile_enabled = self.profile_flush_chunks > 0
+        batch_wait_t0 = perf_counter()
 
         with progress_bar:
 
             for batch in islice(self.train_loader, self.steps_per_epoch):
+                if profile_enabled:
+                    profile_window["loader_wait"] += perf_counter() - batch_wait_t0
                 chunks += batch[0].shape[0]
-                losses, grad_norm, scale = self.train_one_step(batch)
+                losses, grad_norm, scale, timings = self.train_one_step(batch, profile_enabled=profile_enabled)
+                if profile_enabled:
+                    profile_window["chunks"] += batch[0].shape[0]
+                    profile_window["steps"] += 1
+                    for key in ("device_transfer", "forward", "criterion", "backward", "optimizer", "wall"):
+                        profile_window[key] += timings[key]
 
                 if smoothed_losses is None:
                     smoothed_losses = dict(losses)
@@ -203,6 +315,23 @@ class TrainerMod:
                     })
 
                 if lr_scheduler is not None: lr_scheduler.step()
+                if profile_enabled and profile_window["chunks"] >= self.profile_flush_chunks:
+                    self._flush_profile_window(
+                        profile_window,
+                        self._alignment_cache_stats(),
+                        chunks,
+                    )
+                    profile_window = self._new_profile_window()
+                    self._reset_alignment_cache_stats()
+                batch_wait_t0 = perf_counter()
+
+        if profile_enabled and profile_window["steps"] > 0:
+            self._flush_profile_window(
+                profile_window,
+                self._alignment_cache_stats(),
+                chunks,
+            )
+            self._reset_alignment_cache_stats()
 
         return smoothed_losses or {}, perf_counter() - t0
 

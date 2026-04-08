@@ -119,6 +119,7 @@ def main(args):
         quantile_grad_clip=args.quantile_grad_clip,
         chunks_per_epoch=args.chunks,
         batch_size=args.batch,
+        profile_flush_chunks=args.profile_chunks,
     )
 
     if (',' in args.lr):
@@ -156,4 +157,5 @@ def argparser():
     quantile_group.add_argument('--no-quantile-grad-clip', dest='quantile_grad_clip', action='store_false')
     quantile_group.set_defaults(quantile_grad_clip=True)
     parser.add_argument("--num-workers", default=4, type=int)
+    parser.add_argument("--profile-chunks", default=10000, type=int, help="Flush training profiling stats every N chunks; set 0 to disable.")
     return parser

@@ -230,6 +230,9 @@ bonito train_mod runs/multihead_r9 \
 - base decode results are cached per forward output and reused by loss/projection/prediction helpers
 - standalone training reuses per-sample alignment/projection results when stable sample keys are available from the built-in numpy loader
 - standalone training skips base-loss computation because the frozen basecaller is not optimized
+- standalone training prints profiling summaries every `10000` chunks by default, including dataloader/transfer/forward/criterion/backward/optimizer timings and alignment-cache hit rate
+
+Use `--profile-chunks 0` to disable the periodic profiling output or set a different flush interval.
 
 This is the recommended mode when you want to benchmark modification detection against the unchanged official basecaller output.
 

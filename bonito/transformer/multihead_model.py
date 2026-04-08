@@ -257,6 +257,7 @@ class MultiHeadModel(torch.nn.Module):
             0,
         )
         self._alignment_cache = OrderedDict()
+        self.reset_alignment_cache_stats()
         if self.standalone_mod_head:
             self._freeze_basecaller_parameters()
             self._set_basecaller_eval()
@@ -455,6 +456,22 @@ class MultiHeadModel(torch.nn.Module):
         while len(self._alignment_cache) > self.alignment_cache_capacity:
             self._alignment_cache.popitem(last=False)
 
+    def reset_alignment_cache_stats(self) -> None:
+        self._alignment_cache_hits = 0
+        self._alignment_cache_misses = 0
+
+    def alignment_cache_stats(self) -> Dict[str, int | float]:
+        lookups = self._alignment_cache_hits + self._alignment_cache_misses
+        hit_rate = (self._alignment_cache_hits / lookups) if lookups else 0.0
+        return {
+            "hits": int(self._alignment_cache_hits),
+            "misses": int(self._alignment_cache_misses),
+            "lookups": int(lookups),
+            "hit_rate": float(hit_rate),
+            "size": int(len(self._alignment_cache)),
+            "capacity": int(self.alignment_cache_capacity),
+        }
+
     def _head_probabilities(self, head_name: str, logits: torch.Tensor) -> torch.Tensor:
         if logits.shape[-1] == 1:
             return torch.ones_like(logits, dtype=torch.float32)
@@ -614,6 +631,11 @@ class MultiHeadModel(torch.nn.Module):
         for sample_idx in range(target_lengths.shape[0]):
             target_len = int(target_lengths[sample_idx].item())
             cached_entry = self._alignment_cache_get(sample_keys[sample_idx]) if sample_keys is not None else None
+            if sample_keys is not None:
+                if cached_entry is None:
+                    self._alignment_cache_misses += 1
+                else:
+                    self._alignment_cache_hits += 1
             if cached_entry is None:
                 if predictions is None:
                     predictions = self._decoded_base_predictions(outputs)
