@@ -460,3 +460,32 @@ python validate/visualize_mod_predictions.py \
     --device cuda:0 \
     --num-reads 10 \
     --recursive
+
+
+
+# =========================== ONLY TRAIN MULTIHEAD ===================================
+
+
+bonito train_mod -f /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_only_ft \
+    --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_15wmod+15wcan \
+    --config /home/lijy/workspace/bonito/bonito/models/configs/multihead_transformer.toml \
+    --pretrained /home/lijy/workspace/bonito/bonito/models/rna004_130bps_sup@v5.2.0 \
+    --epochs 30 \
+    --batch 64 \
+    --lr 5e-5 \
+    --chunks 50000 \
+    --valid-chunks 5000 \
+    --device cuda:0 \
+    > /home/lijy/workspace/bonito/log/rna004_m6a_mix_only_ft.log 2>&1
+
+
+python validate/evaluate_train_mod.py \
+  --model_directory /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_only_ft \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_15wmod+15wcan \
+  --dataset valid \
+  --weights 30 \
+  --chunks 50000 \
+  --valid-chunks 5000 \
+  --batchsize 64 \
+  --device cuda:0 \
+  --output-dir /home/lijy/workspace/bonito/validate/res/rna004_m6a_mix_only_ft/validate_epoch30
