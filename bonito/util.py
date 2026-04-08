@@ -257,10 +257,11 @@ def load_object(package, obj_name):
     return getattr(import_module(package), obj_name)
 
 def match_names(state_dict, model):
-    keys_and_shapes = lambda state_dict: zip(*[
-        (k, s) for s, i, k in sorted([(v.shape, i, k)
-        for i, (k, v) in enumerate(state_dict.items())])
-    ])
+    def keys_and_shapes(state_dict):
+        return zip(*[
+            (k, s) for s, i, k in sorted([(v.shape, i, k)
+            for i, (k, v) in enumerate(state_dict.items())])
+        ])
     k1, s1 = keys_and_shapes(state_dict)
     k2, s2 = keys_and_shapes(model.state_dict())
     assert s1 == s2
