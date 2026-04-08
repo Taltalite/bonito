@@ -94,6 +94,27 @@ bonito basecaller /home/lijy/workspace/bonito/bonito/models/rna004_130bps_sup@v5
   --batchsize 192 \
   --chunksize 12000 \
   --overlap 600 \
-  --max-reads 100000 \
+  --max-reads 10000 \
   --min-accuracy-save-ctc 0.99 \
-  /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mod/src_data/ > /data/biolab-nvme-pcie2/lijy/m6A/bonito_rna004_sup/mod/PAW43156_92158b33_73a20312_4_10wreads.bam
+  /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mod/src_data/ \
+  > /data/biolab-nvme-pcie2/lijy/m6A/bonito_rna004_sup/mod/PAW43156_92158b33_73a20312_4_10wreads.bam
+
+
+# create_dataset_dorado_ctc_like
+# mod dataset
+python create_dataset_dorado_ctc_like.py \
+  --bam-file /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/mod_bam/PAW43156_92158b33_73a20312_0+10.sorted.bam \
+  --pod5-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/mod_pod5/ \
+  --reference-fasta /data/biolab-nvme-pcie2/lijy/HG002/hg38.fa \
+  --output-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mod_PAW43156_92158b33_73a20312_0+10_ctclike/ \
+  --sample-type rna \
+  --chunk-len 12000 \
+  --overlap 600 \
+  --filter-preset strict \
+  --norm-strategy from-bam \
+  --workers 12 \
+  --task-batch-size 4 \
+  --max-pending-batches 1 \
+  --max-samples-per-worker-file 128 \
+  --mp-start-method fork \
+  --max-chunks 1000
