@@ -497,6 +497,59 @@ python validate/evaluate_train_mod.py \
   --dataset valid \
   --chunks 50000 \
   --valid-chunks 5000 \
-  --batchsize 64 \
+  --batchsize 32 \
   --device cuda:0 \
   --output-dir /home/lijy/workspace/bonito/validate/res/rna004_sup_520/validate_50000chunks
+
+
+# =========================== NEW DATASET TRAIN_MOD ===================================
+
+
+bonito train_mod -f /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_only_minitest \
+    --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_PAW43156_92158b33_73a20312_0+10_ctclike/ \
+    --config /home/lijy/workspace/bonito/bonito/models/configs/multihead_transformer.toml \
+    --pretrained /home/lijy/workspace/bonito/bonito/models/rna004_130bps_sup@v5.2.0 \
+    --epochs 30 \
+    --batch 64 \
+    --lr 1e-4 \
+    --chunks 20000 \
+    --valid-chunks 1500 \
+    --device cuda:0 \
+    > /home/lijy/workspace/bonito/log/rna004_m6a_mix_only_minitest.log 2>&1
+
+python validate/evaluate_train_mod.py \
+  --model_directory /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_only_minitest \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_PAW43156_92158b33_73a20312_0+10_ctclike/ \
+  --dataset valid \
+  --weights 30 \
+  --chunks 20000 \
+  --valid-chunks 1500 \
+  --batchsize 16 \
+  --device cuda:0 \
+  --output-dir /home/lijy/workspace/bonito/validate/res/rna004_m6a_mix_only_minitest/validate_20000chunks
+
+
+
+
+bonito train_mod -f /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_only_largetest \
+    --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_PAW43156_92158b33_73a20312_0+10_ctclike_L/ \
+    --config /home/lijy/workspace/bonito/bonito/models/configs/multihead_transformer.toml \
+    --pretrained /home/lijy/workspace/bonito/bonito/models/rna004_130bps_sup@v5.2.0 \
+    --epochs 20 \
+    --batch 48 \
+    --lr 1e-4 \
+    --chunks 100000 \
+    --valid-chunks 10000 \
+    --device cuda:0 \
+    > /home/lijy/workspace/bonito/log/rna004_m6a_mix_only_largetest.log 2>&1
+
+python validate/evaluate_train_mod.py \
+  --model_directory /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_only_largetest \
+  --directory /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_PAW43156_92158b33_73a20312_0+10_ctclike_L/ \
+  --dataset valid \
+  --weights 20 \
+  --chunks 100000 \
+  --valid-chunks 10000 \
+  --batchsize 16 \
+  --device cuda:0 \
+  --output-dir /home/lijy/workspace/bonito/validate/res/rna004_m6a_mix_only_largetest/validate_100000chunks

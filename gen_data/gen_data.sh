@@ -100,7 +100,7 @@ bonito basecaller /home/lijy/workspace/bonito/bonito/models/rna004_130bps_sup@v5
   > /data/biolab-nvme-pcie2/lijy/m6A/bonito_rna004_sup/mod/PAW43156_92158b33_73a20312_4_10wreads.bam
 
 
-# create_dataset_dorado_ctc_like
+# =============================== create_dataset_dorado_ctc_like =============================
 # mod dataset
 python create_dataset_dorado_ctc_like.py \
   --bam-file /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/mod_bam/PAW43156_92158b33_73a20312_0+10.sorted.bam \
@@ -110,11 +110,125 @@ python create_dataset_dorado_ctc_like.py \
   --sample-type rna \
   --chunk-len 12000 \
   --overlap 600 \
-  --filter-preset strict \
+  --min-accuracy 0.95 \
+  --min-coverage 0.85 \
+  --mm2-preset lr:hq \
   --norm-strategy from-bam \
   --workers 12 \
   --task-batch-size 4 \
   --max-pending-batches 1 \
   --max-samples-per-worker-file 128 \
   --mp-start-method fork \
-  --max-chunks 1000
+  --max-chunks 10000
+
+python make_mod_targets_m6a.py \
+  --dataset-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mod_PAW43156_92158b33_73a20312_0+10_ctclike/ \
+  --mode full-mod \
+  --non-a-policy ignore
+
+
+# canonical dataset
+python create_dataset_dorado_ctc_like.py \
+  --bam-file /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/canonical_bam/PAW51322_0f2f3583_34a338cb_0+10.sorted.bam \
+  --pod5-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/canonical_pod5/ \
+  --reference-fasta /data/biolab-nvme-pcie2/lijy/HG002/hg38.fa \
+  --output-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/canonical_PAW51322_0f2f3583_34a338cb_0+10_ctclike/ \
+  --sample-type rna \
+  --chunk-len 12000 \
+  --overlap 600 \
+  --min-accuracy 0.95 \
+  --min-coverage 0.85 \
+  --mm2-preset lr:hq \
+  --norm-strategy from-bam \
+  --workers 12 \
+  --task-batch-size 4 \
+  --max-pending-batches 1 \
+  --max-samples-per-worker-file 128 \
+  --mp-start-method fork \
+  --max-chunks 10000
+
+python make_mod_targets_m6a.py \
+  --dataset-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/canonical_PAW51322_0f2f3583_34a338cb_0+10_ctclike/ \
+  --mode canonical \
+  --non-a-policy ignore
+
+# merge into one train_mod dataset
+python merge_mod_datasets.py \
+  --full-mod-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mod_PAW43156_92158b33_73a20312_0+10_ctclike/ \
+  --canonical-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/canonical_PAW51322_0f2f3583_34a338cb_0+10_ctclike/ \
+  --output-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_PAW43156_92158b33_73a20312_0+10_ctclike/
+
+# ============================================================================================
+
+# =============================== LARGE DATASET create_dataset_dorado_ctc_like =============================
+# mod dataset
+python create_dataset_dorado_ctc_like.py \
+  --bam-file /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/mod_bam/PAW43156_92158b33_73a20312_0+10.sorted.bam \
+  --pod5-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/mod_pod5/ \
+  --reference-fasta /data/biolab-nvme-pcie2/lijy/HG002/hg38.fa \
+  --output-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mod_PAW43156_92158b33_73a20312_0+10_ctclike_L/ \
+  --sample-type rna \
+  --chunk-len 12000 \
+  --overlap 600 \
+  --min-accuracy 0.95 \
+  --min-coverage 0.85 \
+  --mm2-preset lr:hq \
+  --norm-strategy from-bam \
+  --workers 12 \
+  --task-batch-size 4 \
+  --max-pending-batches 1 \
+  --max-samples-per-worker-file 128 \
+  --mp-start-method fork \
+  --max-chunks 50000
+
+python make_mod_targets_m6a.py \
+  --dataset-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mod_PAW43156_92158b33_73a20312_0+10_ctclike_L/ \
+  --mode full-mod \
+  --non-a-policy ignore
+
+
+# canonical dataset
+python create_dataset_dorado_ctc_like.py \
+  --bam-file /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/canonical_bam/PAW51322_0f2f3583_34a338cb_0+10.sorted.bam \
+  --pod5-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/canonical_pod5/ \
+  --reference-fasta /data/biolab-nvme-pcie2/lijy/HG002/hg38.fa \
+  --output-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/canonical_PAW51322_0f2f3583_34a338cb_0+10_ctclike_L/ \
+  --sample-type rna \
+  --chunk-len 12000 \
+  --overlap 600 \
+  --min-accuracy 0.95 \
+  --min-coverage 0.85 \
+  --mm2-preset lr:hq \
+  --norm-strategy from-bam \
+  --workers 12 \
+  --task-batch-size 4 \
+  --max-pending-batches 1 \
+  --max-samples-per-worker-file 128 \
+  --mp-start-method fork \
+  --max-chunks 50000
+
+python make_mod_targets_m6a.py \
+  --dataset-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/canonical_PAW51322_0f2f3583_34a338cb_0+10_ctclike_L/ \
+  --mode canonical \
+  --non-a-policy ignore
+
+# merge into one train_mod dataset
+python merge_mod_datasets.py \
+  --full-mod-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mod_PAW43156_92158b33_73a20312_0+10_ctclike_L/ \
+  --canonical-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/canonical_PAW51322_0f2f3583_34a338cb_0+10_ctclike_L/ \
+  --output-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mix_PAW43156_92158b33_73a20312_0+10_ctclike_L/
+
+# just for comparison, create dataset with the old create_dataset_mpv8.py
+python create_dataset_mpv8.py \
+    --bam-file /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/mod_bam/PAW43156_92158b33_73a20312_0+10.sorted.bam \
+    --pod5-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/mod_pod5/ \
+    --reference-fasta /data/biolab-nvme-pcie2/lijy/HG002/hg38.fa \
+    --output-dir /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/mix/dataset/mpv8_test \
+    --sample-type rna \
+    --max-chunks 10000 \
+    --workers 8 \
+    --chunk-len 12000 \
+    --overlap 600 \
+    --norm-strategy pa \
+    --pa-mean 79.17339964465278 \
+    --pa-std 16.929280371741893
