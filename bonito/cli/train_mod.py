@@ -5,6 +5,7 @@ Bonito training for multi-head (base + modification) models.
 """
 
 import os
+from copy import deepcopy
 from pathlib import Path
 from importlib import import_module
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
@@ -19,15 +20,145 @@ from bonito.util import STANDALONE_MOD_HEAD_MODE, load_pretrained_weights, load_
 
 
 train_mod_default_config = Path(__file__).resolve().parent.parent / "models/configs/multihead_transformer.toml"
+RUNTIME_CONFIG_KEYS = (
+    "basecaller",
+    "scaling",
+    "standardisation",
+    "normalisation",
+    "run_info",
+    "qscore",
+)
 
 
-def load_pretrained_encoder_config(pretrained):
+def load_pretrained_config(pretrained):
     dirname = resolve_model_dir(pretrained)
     pretrain_file = os.path.join(dirname, "config.toml")
     if not os.path.exists(pretrain_file):
         raise FileNotFoundError(f"Pretrained config not found: {pretrain_file}")
-    pretrained_config = toml.load(pretrain_file)
+    return toml.load(pretrain_file)
+
+
+def load_pretrained_encoder_config(pretrained):
+    pretrained_config = load_pretrained_config(pretrained)
     return pretrained_config.get("model", {}).get("encoder")
+
+
+def extract_pretrained_state_len(pretrained_config):
+    model_cfg = pretrained_config.get("model", {})
+    seqdist_cfg = model_cfg.get("seqdist", {})
+    if "state_len" in seqdist_cfg:
+        return int(seqdist_cfg["state_len"])
+    encoder_crf = model_cfg.get("encoder", {}).get("crf", {})
+    if "state_len" in encoder_crf:
+        return int(encoder_crf["state_len"])
+    global_norm = pretrained_config.get("global_norm", {})
+    if "state_len" in global_norm:
+        return int(global_norm["state_len"])
+    return None
+
+
+def extract_pretrained_labels(pretrained_config):
+    labels_cfg = pretrained_config.get("labels", {}).get("labels")
+    if labels_cfg is not None:
+        return list(labels_cfg)
+    seqdist_alphabet = pretrained_config.get("model", {}).get("seqdist", {}).get("alphabet")
+    if seqdist_alphabet is not None:
+        return list(seqdist_alphabet)
+    return None
+
+
+def extract_pretrained_input_features(pretrained_config):
+    input_cfg = pretrained_config.get("input", {})
+    if "features" in input_cfg:
+        return int(input_cfg["features"])
+
+    conv_sublayers = pretrained_config.get("model", {}).get("encoder", {}).get("conv", {}).get("sublayers", [])
+    for layer in conv_sublayers:
+        if layer.get("type") == "convolution" and "insize" in layer:
+            return int(layer["insize"])
+    return None
+
+
+def merge_pretrained_runtime_config(config, pretrained_config):
+    for key in RUNTIME_CONFIG_KEYS:
+        if key in pretrained_config:
+            config[key] = deepcopy(pretrained_config[key])
+
+    pretrained_labels = extract_pretrained_labels(pretrained_config)
+    if pretrained_labels is not None:
+        merged_labels = deepcopy(config.get("labels", {}))
+        merged_labels["labels"] = list(pretrained_labels)
+        config["labels"] = merged_labels
+
+    pretrained_input_features = extract_pretrained_input_features(pretrained_config)
+    if pretrained_input_features is not None:
+        merged_input = deepcopy(config.get("input", {}))
+        merged_input["features"] = int(pretrained_input_features)
+        config["input"] = merged_input
+
+    pretrained_state_len = extract_pretrained_state_len(pretrained_config)
+    if pretrained_state_len is not None:
+        merged_global_norm = deepcopy(config.get("global_norm", {}))
+        merged_global_norm["state_len"] = int(pretrained_state_len)
+        config["global_norm"] = merged_global_norm
+
+    return config
+
+
+def validate_pretrained_runtime_config(config, pretrained_config, model=None):
+    pretrained_state_len = extract_pretrained_state_len(pretrained_config)
+    if pretrained_state_len is None:
+        raise ValueError("Unable to resolve pretrained state_len from pretrained config.")
+
+    current_labels = list(config.get("labels", {}).get("labels", []) or [])
+    pretrained_labels = extract_pretrained_labels(pretrained_config)
+    if pretrained_labels is None:
+        raise ValueError("Unable to resolve pretrained labels/alphabet from pretrained config.")
+    if current_labels != list(pretrained_labels):
+        raise ValueError(
+            "train_mod config labels do not match the pretrained basecaller alphabet. "
+            f"current={current_labels} pretrained={list(pretrained_labels)}"
+        )
+
+    current_features = config.get("input", {}).get("features")
+    pretrained_features = extract_pretrained_input_features(pretrained_config)
+    if pretrained_features is None:
+        raise ValueError("Unable to resolve pretrained input.features from pretrained config.")
+    if current_features != pretrained_features:
+        raise ValueError(
+            "train_mod config input.features does not match the pretrained basecaller. "
+            f"current={current_features} pretrained={pretrained_features}"
+        )
+
+    pretrained_sample_type = str(pretrained_config.get("run_info", {}).get("sample_type", "")).strip()
+    current_sample_type = str(config.get("run_info", {}).get("sample_type", "")).strip()
+    if pretrained_sample_type and current_sample_type != pretrained_sample_type:
+        raise ValueError(
+            "train_mod config run_info.sample_type does not match the pretrained basecaller. "
+            f"current={current_sample_type!r} pretrained={pretrained_sample_type!r}"
+        )
+
+    scaling_cfg = config.get("scaling")
+    if not scaling_cfg:
+        raise ValueError("train_mod config is missing scaling copied from the pretrained basecaller.")
+    if str(scaling_cfg.get("strategy", "")).strip() == "pa" and not config.get("standardisation"):
+        raise ValueError(
+            "train_mod config uses scaling.strategy='pa' but standardisation is missing. "
+            "Standalone mod-head inference would use incorrect signal normalization."
+        )
+    if not config.get("standardisation") and not config.get("normalisation"):
+        raise ValueError(
+            "train_mod config is missing both standardisation and normalisation. "
+            "Standalone mod-head inference would fall back to inconsistent runtime behavior."
+        )
+
+    if model is not None:
+        model_state_len = int(model.seqdist.state_len)
+        if model_state_len != pretrained_state_len:
+            raise ValueError(
+                "Reconstructed multi-head model state_len does not match the pretrained basecaller. "
+                f"model={model_state_len} pretrained={pretrained_state_len}"
+            )
 
 
 def main(args):
@@ -42,15 +173,19 @@ def main(args):
 
     config = toml.load(args.config)
     config["__config_dir__"] = str(Path(args.config).resolve().parent)
+    pretrained_config = load_pretrained_config(args.pretrained)
     pretrained_encoder = config.get("model", {}).get("pretrained_encoder")
     if pretrained_encoder is None:
-        pretrained_encoder = load_pretrained_encoder_config(args.pretrained)
+        pretrained_encoder = pretrained_config.get("model", {}).get("encoder")
         if not pretrained_encoder:
             raise ValueError(
                 "train_mod requires a pretrained basecaller with model.encoder in config.toml "
                 "so standalone mod-head training can reconstruct the frozen encoder."
             )
         config.setdefault("model", {})["pretrained_encoder"] = pretrained_encoder
+
+    config = merge_pretrained_runtime_config(config, pretrained_config)
+    validate_pretrained_runtime_config(config, pretrained_config)
 
     training_cfg = {
         **config.get("training", {}),
@@ -66,6 +201,7 @@ def main(args):
 
     print("[loading model]")
     model = load_symbol(config, 'Model')(config)
+    validate_pretrained_runtime_config(config, pretrained_config, model=model)
     preload_stats = load_pretrained_weights(model, args.pretrained, device)
 
     try:

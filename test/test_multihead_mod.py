@@ -20,6 +20,8 @@ except ModuleNotFoundError:
     torch = None
 
 if torch is not None:
+    from bonito.cli.train_mod import merge_pretrained_runtime_config, validate_pretrained_runtime_config
+    from bonito.transformer import multihead_basecall
     from bonito.transformer.multihead_model import MultiHeadModel
     from bonito.util import load_model
 
@@ -326,6 +328,157 @@ class TestMultiHeadModModel(unittest.TestCase):
                     rtol=1e-5,
                 )
             )
+
+
+@unittest.skipUnless(torch is not None, "torch is required for model tests")
+class TestStandaloneModConfigCompatibility(unittest.TestCase):
+    def _standalone_config(self):
+        return {
+            "model": {
+                "package": "bonito.transformer.multihead_model",
+                "d_model": 16,
+                "nhead": 2,
+                "dim_feedforward": 32,
+                "num_layers": 1,
+                "kernel_size": 3,
+                "stride": 2,
+                "mod_loss_weight": 1.0,
+                "mod_target_projection": "viterbi_edlib_equal",
+                "mod_decode_projection": "viterbi_path",
+                "mod_bases": ["A", "C", "G", "T"],
+                "mod_global_labels": [
+                    "canonical_A",
+                    "canonical_C",
+                    "canonical_G",
+                    "canonical_T",
+                    "m6A",
+                ],
+                "mod_trunk_dim": 8,
+                "mod_trunk_kernel_size": 3,
+                "mod_trunk_depth": 1,
+                "mod_head_dropout": 0.0,
+                "mod_head_defs": {
+                    "A": ["canonical_A", "m6A"],
+                    "C": ["canonical_C"],
+                    "G": ["canonical_G"],
+                    "T": ["canonical_T"],
+                },
+                "base_slot_aliases": {
+                    "T": ["T", "U"],
+                },
+            },
+            "input": {
+                "features": 1,
+                "n_pre_post_context_bases": [0, 0],
+            },
+            "labels": {
+                "labels": ["", "A", "C", "G", "T"],
+            },
+            "global_norm": {
+                "state_len": 4,
+            },
+        }
+
+    def _official_pretrained_config(self):
+        return {
+            "basecaller": {
+                "batchsize": 128,
+                "chunksize": 12000,
+                "overlap": 600,
+            },
+            "scaling": {
+                "strategy": "pa",
+            },
+            "standardisation": {
+                "standardise": 1,
+                "mean": 79.17,
+                "stdev": 16.93,
+            },
+            "run_info": {
+                "sample_type": "rna",
+                "sample_rate": 4000,
+            },
+            "qscore": {
+                "strategy": "trim_polyA",
+                "scale": 1.25,
+                "bias": 1.5,
+            },
+            "model": {
+                "seqdist": {
+                    "state_len": 5,
+                    "alphabet": ["N", "A", "C", "G", "T"],
+                },
+                "encoder": {
+                    "conv": {
+                        "sublayers": [
+                            {
+                                "type": "convolution",
+                                "insize": 1,
+                                "size": 64,
+                            },
+                        ],
+                    },
+                    "crf": {
+                        "state_len": 5,
+                    },
+                },
+            },
+        }
+
+    def test_merge_pretrained_runtime_config_copies_runtime_fields(self):
+        config = self._standalone_config()
+        pretrained_config = self._official_pretrained_config()
+
+        merged = merge_pretrained_runtime_config(config, pretrained_config)
+
+        self.assertEqual(merged["basecaller"], pretrained_config["basecaller"])
+        self.assertEqual(merged["scaling"], pretrained_config["scaling"])
+        self.assertEqual(merged["standardisation"], pretrained_config["standardisation"])
+        self.assertEqual(merged["run_info"], pretrained_config["run_info"])
+        self.assertEqual(merged["qscore"], pretrained_config["qscore"])
+        self.assertEqual(merged["labels"]["labels"], ["N", "A", "C", "G", "T"])
+        self.assertEqual(merged["input"]["features"], 1)
+        self.assertEqual(merged["global_norm"]["state_len"], 5)
+
+    def test_validate_pretrained_runtime_config_rejects_missing_scaling(self):
+        config = self._standalone_config()
+        pretrained_config = self._official_pretrained_config()
+        merged = merge_pretrained_runtime_config(config, pretrained_config)
+        merged.pop("scaling")
+
+        with self.assertRaisesRegex(ValueError, "missing scaling"):
+            validate_pretrained_runtime_config(merged, pretrained_config)
+
+    def test_validate_pretrained_runtime_config_checks_model_state_len(self):
+        config = self._standalone_config()
+        pretrained_config = self._official_pretrained_config()
+        merged = merge_pretrained_runtime_config(config, pretrained_config)
+
+        class DummySeqdist:
+            state_len = 4
+
+        class DummyModel:
+            seqdist = DummySeqdist()
+
+        with self.assertRaisesRegex(ValueError, "state_len does not match"):
+            validate_pretrained_runtime_config(merged, pretrained_config, model=DummyModel())
+
+
+@unittest.skipUnless(torch is not None, "torch is required for model tests")
+class TestMultiHeadBasecallDecodePath(unittest.TestCase):
+    def test_decode_basecall_batch_delegates_to_shared_decode_scores(self):
+        model = mock.Mock()
+        model.seqdist = object()
+        base_scores = mock.Mock()
+        base_scores.ndim = 3
+        base_scores.device = "cuda:0"
+
+        sentinel = {"sequence": "ACGT"}
+        with mock.patch("bonito.transformer.multihead_basecall.decode_scores", return_value=sentinel) as decode_scores:
+            result = multihead_basecall._decode_basecall_batch(model, base_scores, reverse=True)
+
+        self.assertIs(result, sentinel)
+        decode_scores.assert_called_once_with(base_scores, model.seqdist, reverse=True)
 
 
 class TestMakeModTargetsM6A(unittest.TestCase):

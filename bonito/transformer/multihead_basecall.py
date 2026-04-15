@@ -10,9 +10,9 @@ from typing import Dict, Iterable, Iterator, List, Tuple
 import edlib
 import numpy as np
 import torch
-from koi.decode import beam_search, to_str
+from koi.decode import to_str
 
-from bonito.crf.basecall import stitch_results
+from bonito.crf.basecall import decode_scores, stitch_results
 from bonito.multiprocessing import thread_iter
 from bonito.util import batchify, chunk, unbatchify
 
@@ -60,44 +60,15 @@ def _equal_alignment_pairs(query_seq: str, target_seq: str) -> List[Tuple[int, i
     return pairs
 
 
-def _prepare_base_scores_for_beam_search(model, base_scores: torch.Tensor) -> torch.Tensor:
+def _decode_basecall_batch(model, base_scores: torch.Tensor, reverse: bool = False) -> Dict[str, object]:
     if base_scores.ndim != 3:
         raise ValueError(f"Expected base_scores with 3 dims, got shape {tuple(base_scores.shape)}")
-
-    scores = base_scores.permute(1, 0, 2).contiguous()
-    n_base = int(model.seqdist.n_base)
-    expected_expanded = (n_base + 1) * (n_base ** model.seqdist.state_len)
-    if scores.shape[-1] == expected_expanded:
-        scores = scores.view(scores.shape[0], scores.shape[1], -1, n_base + 1)[..., 1:]
-        scores = scores.reshape(scores.shape[0], scores.shape[1], -1).contiguous()
-    return scores
-
-
-def _decode_basecall_batch(model, base_scores: torch.Tensor, reverse: bool = False) -> Dict[str, object]:
-    scores = base_scores
-    if reverse:
-        scores = model.seqdist.reverse_complement(scores)
-    scores = _prepare_base_scores_for_beam_search(model, scores)
-    if not str(scores.device).startswith("cuda"):
+    if not str(base_scores.device).startswith("cuda"):
         raise RuntimeError(
             "basecaller_mod currently requires a CUDA device for beam-search basecalling. "
             "Use a CUDA device or validate with CLI/import smoke checks only."
         )
-
-    with torch.cuda.device(scores.device):
-        sequence, qstring, moves = beam_search(
-            scores,
-            beam_width=32,
-            beam_cut=100.0,
-            scale=1.0,
-            offset=0.0,
-            blank_score=2.0,
-        )
-    return {
-        "sequence": sequence.detach().cpu() if isinstance(sequence, torch.Tensor) else sequence,
-        "qstring": qstring.detach().cpu() if isinstance(qstring, torch.Tensor) else qstring,
-        "moves": moves.detach().cpu() if isinstance(moves, torch.Tensor) else moves,
-    }
+    return decode_scores(base_scores, model.seqdist, reverse=reverse)
 
 
 def _run_model_on_batch(model, batch: torch.Tensor, reverse: bool = False) -> Dict[str, object]:

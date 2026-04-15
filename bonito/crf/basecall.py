@@ -24,6 +24,28 @@ def stitch_results(results, length, size, overlap, stride, reverse=False):
     return stitch(results, size, overlap, length, stride, reverse=reverse)
 
 
+def decode_scores(scores, seqdist, beam_width=32, beam_cut=100.0, scale=1.0, offset=0.0, blank_score=2.0, reverse=False):
+    """
+    Decode precomputed CRF scores with Bonito's beam search.
+    """
+    if reverse:
+        scores = seqdist.reverse_complement(scores)
+    with torch.cuda.device(scores.device):
+        sequence, qstring, moves = beam_search(
+            scores,
+            beam_width=beam_width,
+            beam_cut=beam_cut,
+            scale=scale,
+            offset=offset,
+            blank_score=blank_score,
+        )
+    return {
+        'moves': moves,
+        'qstring': qstring,
+        'sequence': sequence,
+    }
+
+
 def compute_scores(model, batch, beam_width=32, beam_cut=100.0, scale=1.0, offset=0.0, blank_score=2.0, reverse=False):
     """
     Compute scores for model.
@@ -31,18 +53,16 @@ def compute_scores(model, batch, beam_width=32, beam_cut=100.0, scale=1.0, offse
     with torch.inference_mode():
         device = next(model.parameters()).device
         scores = model(batch.to(torch.float16).to(device))
-        if reverse:
-            scores = model.seqdist.reverse_complement(scores)
-        with torch.cuda.device(scores.device):
-            sequence, qstring, moves = beam_search(
-                scores, beam_width=beam_width, beam_cut=beam_cut,
-                scale=scale, offset=offset, blank_score=blank_score
-            )
-        return {
-            'moves': moves,
-            'qstring': qstring,
-            'sequence': sequence,
-        }
+        return decode_scores(
+            scores,
+            model.seqdist,
+            beam_width=beam_width,
+            beam_cut=beam_cut,
+            scale=scale,
+            offset=offset,
+            blank_score=blank_score,
+            reverse=reverse,
+        )
 
 
 def fmt(stride, attrs, rna=False):
