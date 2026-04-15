@@ -1,0 +1,12 @@
+read_id: read_mod_1
+reference_name: *
+is_reverse: 0
+sequence_length: 10
+shown_bases: 10
+num_mod_sites: 3
+
+[     0-     9]
+ACGTACGTAA
+^    ^   ^
+a    m   a
+mods: 0:A+a(0.90), 5:C+m(0.78), 9:A+a(0.71)
