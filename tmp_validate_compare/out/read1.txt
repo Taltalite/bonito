@@ -1,0 +1,18 @@
+read_id: read1
+reference_name: *
+is_reverse: 0
+sequence_length: 10
+shown_bases: 10
+num_mod_sites: 3
+dorado_sequence_length: 10
+dorado_shown_bases: 10
+dorado_identity: 0.9000
+dorado_edit_distance: 1
+
+[     0-     9]
+bonito : ACGTACGTAA
+mods   : ^    ^   ^
+labels : a    m   a
+match  : ||||x|||||
+dorado : ACGTTCGTAA
+mods: 0:A+a(0.90), 5:C+m(0.78), 9:A+a(0.71)

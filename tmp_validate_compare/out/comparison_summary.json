@@ -1,0 +1,16 @@
+{
+  "basecaller_mod_bam": "/home/lijy/bonito/tmp_validate_compare/mod.bam",
+  "dorado_bam": "/home/lijy/bonito/tmp_validate_compare/dorado.bam",
+  "counts": {
+    "num_basecaller_mod_reads": 2,
+    "num_dorado_reads_indexed": 2,
+    "num_reads_compared": 2,
+    "num_reads_missing_in_dorado_bam": 0
+  },
+  "metrics": {
+    "mean_identity": 0.95,
+    "median_identity": 0.95,
+    "mean_edit_distance": 0.5,
+    "same_length_fraction": 1.0
+  }
+}
