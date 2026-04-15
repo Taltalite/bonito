@@ -4,6 +4,7 @@ Bonito utils
 
 import os
 import re
+import sys
 import random
 from glob import glob
 from itertools import groupby
@@ -337,13 +338,15 @@ def load_matching_weights(model, state_dict, *, device=None, allow_remap=True):
 def load_pretrained_weights(model, pretrained, device):
     dirname = resolve_model_dir(pretrained)
     weights = get_last_checkpoint(dirname)
-    print(f"[loading pretrained weights] - {weights}")
+    sys.stderr.write(f"[loading pretrained weights] - {weights}\n")
     state_dict = torch.load(weights, map_location=device, weights_only=False)
     stats = load_matching_weights(model, state_dict, device=device)
     stats["path"] = str(weights)
-    print(f"[loading pretrained weights] - matched={stats['matched']} skipped={stats['skipped']}")
+    sys.stderr.write(
+        f"[loading pretrained weights] - matched={stats['matched']} skipped={stats['skipped']}\n"
+    )
     if stats["matched"] == 0:
-        print("[warning] No pretrained weights matched current model parameters.")
+        sys.stderr.write("[warning] No pretrained weights matched current model parameters.\n")
     return stats
 
 
@@ -423,7 +426,9 @@ def _load_model(model_file, config, device, half=True, use_koi=False, compile=Tr
         try:
             model = torch.compile(model)
         except RuntimeError as e:
-            print(f"[warning] Torch model failed to compile, performance may be degraded. {e}")
+            sys.stderr.write(
+                f"[warning] Torch model failed to compile, performance may be degraded. {e}\n"
+            )
 
     return model
 
