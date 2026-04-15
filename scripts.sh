@@ -556,4 +556,13 @@ python validate/evaluate_train_mod.py \
 
 
 
-# =========================== NEW DATASET TRAIN_MOD ===================================
+# =========================== WT basecaller_mod test ===================================
+
+bonito basecaller_mod \
+    /data/biolab-nvme-pcie2/lijy/m6A/training_model/rna004_m6a_mix_only_largetest/ \
+    /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/pod5 \
+    --device cuda:0 \
+    --no-use-koi \
+    --recursive \
+    -v \
+    > /data/biolab-nvme-pcie2/lijy/m6A/dorado_rna004_sup/wt_PRJEB80229_open_data/my_pred/rna004_m6a_mix_only_largetest.bam
