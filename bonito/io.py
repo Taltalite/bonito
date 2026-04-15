@@ -455,6 +455,8 @@ class Writer(Thread):
                     tags.append(f'mv:B:c,{encode_moves(res["moves"], res["stride"])}')
 
                 if len(seq):
+                    if len(seq) == 1:
+                        logger.warning("> suspiciously short sequence length 1 for read %s", read_id)
                     if self.mode == 'wfq':
                         write_fastq(read_id, seq, qstring, fd=self.fd, tags=tags)
                     else:

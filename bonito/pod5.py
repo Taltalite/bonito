@@ -3,7 +3,6 @@ Bonito POD5 Utils
 """
 
 from glob import glob
-from uuid import UUID
 from pathlib import Path
 from collections import OrderedDict
 from datetime import timedelta, timezone
@@ -67,18 +66,33 @@ class Read(bonito.reader.Read):
         self.signal = (self.scaled[self.trimmed_samples:] - self.shift) / self.scale
 
 
-def pod5_reads(pod5_file, read_ids, skip=False):
+def _normalize_read_ids(read_ids):
+    if read_ids is None:
+        return None
+    return {str(read_id) for read_id in read_ids}
+
+
+def pod5_reads(pod5_file, read_ids, skip=False, preload=None):
     """
     Get all the reads from the `pod5_file`.
     """
-    if read_ids is not None:
-        yield from Reader(pod5_file).reads(selection=[UUID(rid) for rid in read_ids], missing_ok=True, preload=["samples"])
-    elif skip:
-        for read in Reader(pod5_file).reads(preload=["samples"]):
-            if str(read.read_id) not in read_ids:
-                yield read
-    else:
-        yield from Reader(pod5_file).reads(preload=["samples"])
+    wanted = _normalize_read_ids(read_ids)
+    preload = ["samples"] if preload is None else preload
+
+    if wanted is None and not skip:
+        yield from Reader(pod5_file).reads(preload=preload)
+        return
+
+    for read in Reader(pod5_file).reads(preload=preload):
+        read_id = str(read.read_id)
+        if wanted is None:
+            keep = True
+        else:
+            keep = read_id in wanted
+            if skip:
+                keep = not keep
+        if keep:
+            yield read
 
 
 def get_read_groups(directory, model, read_ids=None, skip=False, n_proc=1, recursive=False, cancel=None):
@@ -92,7 +106,15 @@ def get_read_groups(directory, model, read_ids=None, skip=False, n_proc=1, recur
 
     for pod5_file in pod5_files:
         with Reader(pod5_file) as pod5_fh:
-            num_reads += sum(batch.num_reads for batch in pod5_fh.read_batches())
+            if read_ids is None and not skip:
+                matched_reads = sum(batch.num_reads for batch in pod5_fh.read_batches())
+            else:
+                matched_reads = sum(1 for _ in pod5_reads(pod5_file, read_ids, skip, preload=[]))
+
+            if matched_reads == 0:
+                continue
+
+            num_reads += matched_reads
             for run_info_row in pod5_fh.run_info_table.read_pandas().itertuples():
                 tracking = dict(run_info_row.tracking_id)
                 groupdict = OrderedDict([
