@@ -115,7 +115,8 @@ def capture_sam_record(target_read_id: str):
 def run_cli_capture(cli_module, argv: List[str], target_read_id: str) -> Dict[str, object]:
     parsed = cli_module.argparser().parse_args(argv)
     with capture_sam_record(target_read_id) as captures, \
-         mock.patch.object(cli_module, "tqdm", lambda iterable, **kwargs: iterable):
+         mock.patch.object(cli_module, "tqdm", lambda iterable, **kwargs: iterable), \
+         mock.patch.object(cli_module, "biofmt", lambda aligned=False: bonito_io.Format("unaligned", "bam", "wb")):
         cli_module.main(parsed)
     if not captures:
         raise RuntimeError(f"sam_record was not called for target read_id: {target_read_id}")
