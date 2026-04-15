@@ -553,3 +553,7 @@ python validate/evaluate_train_mod.py \
   --batchsize 16 \
   --device cuda:0 \
   --output-dir /home/lijy/workspace/bonito/validate/res/rna004_m6a_mix_only_largetest/validate_100000chunks
+
+
+
+# =========================== NEW DATASET TRAIN_MOD ===================================
